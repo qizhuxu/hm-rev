@@ -35,6 +35,14 @@ env/
 *.swo
 *~
 
+# Local agent / code-intelligence state
+.agents/
+.claude/
+.codex/
+.gitnexus/
+AGENTS.md
+CLAUDE.md
+
 # Project-specific sensitive data
 cred/
 *.enc
@@ -50,6 +58,13 @@ tmp_*.py
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.pyright/
+.coverage
+coverage/
+htmlcov/
+test-results/
+playwright-report/
+.tmp/
 
 # OS files
 .DS_Store
