@@ -16,6 +16,15 @@ def test_ui_page_is_served(monkeypatch, tmp_path):
     assert "refresh_token" not in response.text
 
 
+def test_webui_page_is_not_served(monkeypatch, tmp_path):
+    monkeypatch.setenv("HM_API_CRED_DIR", str(tmp_path / "cred"))
+    client = TestClient(build_app())
+
+    response = client.get("/webui")
+
+    assert response.status_code == 404
+
+
 def test_ui_status_reports_logged_out_without_tokens(monkeypatch, tmp_path):
     monkeypatch.setenv("HM_API_CRED_DIR", str(tmp_path / "cred"))
     client = TestClient(build_app())
