@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from datetime import UTC, datetime
@@ -18,7 +19,9 @@ from .config import (
     USER_AGENT,
     get_accounts_file,
     get_auth_file,
+    get_default_account_strategy,
     get_token_file,
+    normalize_account_strategy,
 )
 from .crypto import decrypt_value, encrypt_value, load_auth_data, save_auth_data
 
@@ -26,6 +29,7 @@ from .crypto import decrypt_value, encrypt_value, load_auth_data, save_auth_data
 MODEL_CONFIG_URL = (
     f"{DEVECO_BASE_URL}/codeGenie/modelConfig?localVersion=0&pluginVersion=CLI.0.1.0"
 )
+_SELECTION_LOCK = threading.Lock()
 
 
 def _now() -> str:
@@ -33,7 +37,19 @@ def _now() -> str:
 
 
 def _default_state() -> dict[str, Any]:
-    return {"version": 1, "active_account_id": None, "accounts": []}
+    return {
+        "version": 1,
+        "active_account_id": None,
+        "settings": {
+            "account_strategy": get_default_account_strategy(),
+            "round_robin_cursor": 0,
+        },
+        "accounts": [],
+    }
+
+
+def _default_settings() -> dict[str, Any]:
+    return {"account_strategy": get_default_account_strategy(), "round_robin_cursor": 0}
 
 
 def _parse_jwt_payload(token: str) -> dict[str, Any]:
@@ -72,6 +88,8 @@ def _account_public(record: dict[str, Any], active_account_id: str | None) -> di
     }
     public["is_active"] = record.get("account_id") == active_account_id
     public.setdefault("connectivity", None)
+    public["tags"] = _normalize_tags(public.get("tags"))
+    public["note"] = str(public.get("note") or "")
     return public
 
 
@@ -96,10 +114,52 @@ def _encrypted_credentials(
     }
 
 
+def _normalize_tags(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    tags: list[str] = []
+    for item in value:
+        tag = str(item).strip()
+        if tag and tag not in tags:
+            tags.append(tag[:32])
+    return tags[:12]
+
+
+def _normalize_account_record(record: Any) -> dict[str, Any] | None:
+    if not isinstance(record, dict):
+        return None
+    normalized = dict(record)
+    normalized["tags"] = _normalize_tags(normalized.get("tags"))
+    normalized["note"] = str(normalized.get("note") or "")[:500]
+    normalized.setdefault("connectivity", None)
+    normalized.setdefault("last_used_at", None)
+    return normalized
+
+
+def _normalize_settings(value: Any) -> dict[str, Any]:
+    settings = value if isinstance(value, dict) else {}
+    cursor = settings.get("round_robin_cursor", 0)
+    try:
+        cursor = int(cursor)
+    except (TypeError, ValueError):
+        cursor = 0
+    return {
+        "account_strategy": normalize_account_strategy(
+            str(settings.get("account_strategy") or get_default_account_strategy())
+        ),
+        "round_robin_cursor": max(cursor, 0),
+    }
+
+
 def _normalize_state(state: dict[str, Any]) -> dict[str, Any]:
     accounts = state.get("accounts")
     if not isinstance(accounts, list):
         accounts = []
+    accounts = [
+        normalized
+        for account in accounts
+        if (normalized := _normalize_account_record(account)) is not None
+    ]
     active_account_id = state.get("active_account_id")
     if active_account_id and not any(
         account.get("account_id") == active_account_id for account in accounts
@@ -108,6 +168,7 @@ def _normalize_state(state: dict[str, Any]) -> dict[str, Any]:
     return {
         "version": 1,
         "active_account_id": active_account_id,
+        "settings": _normalize_settings(state.get("settings")),
         "accounts": accounts,
     }
 
@@ -149,12 +210,14 @@ def _migrate_legacy_state() -> dict[str, Any]:
                 "updated_at": now,
                 "last_used_at": None,
                 "connectivity": None,
+                "tags": [],
+                "note": "",
                 "credentials": _encrypted_credentials(access, refresh, jwt_token),
             }
         ],
     }
     _write_raw_state(state)
-    return state
+    return _normalize_state(state)
 
 
 def _read_raw_state() -> dict[str, Any]:
@@ -199,6 +262,7 @@ def load_account_state() -> dict[str, Any]:
     return {
         "version": state["version"],
         "active_account_id": state["active_account_id"],
+        "settings": dict(state["settings"]),
         "accounts": [
             _account_public(account, state["active_account_id"])
             for account in state["accounts"]
@@ -228,6 +292,93 @@ def get_active_account() -> dict[str, Any] | None:
             decrypted = _decrypt_account(account, active_account_id)
             return decrypted
     return None
+
+
+def get_account_strategy() -> str:
+    return str(_read_raw_state()["settings"]["account_strategy"])
+
+
+def set_account_strategy(strategy: str) -> str:
+    normalized = normalize_account_strategy(strategy)
+    state = _read_raw_state()
+    state["settings"]["account_strategy"] = normalized
+    _write_raw_state(state)
+    return normalized
+
+
+def _has_valid_credentials(record: dict[str, Any]) -> bool:
+    credentials = record.get("credentials")
+    if not isinstance(credentials, dict):
+        return False
+    required = ("access", "jwt_token")
+    return all(isinstance(credentials.get(key), dict) for key in required)
+
+
+def _connectivity_failed(record: dict[str, Any]) -> bool:
+    connectivity = record.get("connectivity")
+    return isinstance(connectivity, dict) and connectivity.get("success") is False
+
+
+def _decrypt_records(
+    records: list[dict[str, Any]],
+    active_account_id: str | None,
+) -> list[dict[str, Any]]:
+    accounts: list[dict[str, Any]] = []
+    for record in records:
+        try:
+            accounts.append(_decrypt_account(record, active_account_id))
+        except Exception:
+            continue
+    return accounts
+
+
+def select_account_candidates(strategy: str | None = None) -> list[dict[str, Any]]:
+    with _SELECTION_LOCK:
+        state = _read_raw_state()
+        selected_strategy = normalize_account_strategy(
+            strategy or str(state["settings"]["account_strategy"])
+        )
+        active_account_id = state.get("active_account_id")
+        valid_records = [
+            account for account in state["accounts"] if _has_valid_credentials(account)
+        ]
+        healthy_records = [
+            account for account in valid_records if not _connectivity_failed(account)
+        ]
+        pool = healthy_records or valid_records
+
+        if selected_strategy == "active_only":
+            active_records = [
+                account
+                for account in valid_records
+                if account.get("account_id") == active_account_id
+            ]
+            return _decrypt_records(active_records, active_account_id)
+
+        if selected_strategy == "round_robin":
+            if not pool:
+                return []
+            cursor = int(state["settings"].get("round_robin_cursor") or 0) % len(pool)
+            ordered = pool[cursor:] + pool[:cursor]
+            state["settings"]["round_robin_cursor"] = (cursor + 1) % len(pool)
+            _write_raw_state(state)
+            return _decrypt_records(ordered, active_account_id)
+
+        active_records = [
+            account for account in pool if account.get("account_id") == active_account_id
+        ]
+        backup_records = [
+            account for account in pool if account.get("account_id") != active_account_id
+        ]
+        failed_active_records = [
+            account
+            for account in valid_records
+            if account.get("account_id") == active_account_id and account not in pool
+        ]
+        return _decrypt_records(
+            active_records + backup_records + failed_active_records,
+            active_account_id,
+        )
 
 
 def save_account_from_user_info(
@@ -266,6 +417,8 @@ def save_account_from_user_info(
         "updated_at": now,
         "last_used_at": previous.get("last_used_at"),
         "connectivity": previous.get("connectivity"),
+        "tags": _normalize_tags(previous.get("tags")),
+        "note": str(previous.get("note") or "")[:500],
         "credentials": _encrypted_credentials(
             getattr(user_info, "access_token", ""),
             getattr(user_info, "refresh_token", ""),
@@ -301,6 +454,31 @@ def rename_account(account_id: str, display_name: str) -> dict[str, Any]:
     for account in state["accounts"]:
         if account.get("account_id") == account_id:
             account["display_name"] = display_name
+            account["updated_at"] = _now()
+            _write_raw_state(state)
+            return _account_public(account, state["active_account_id"])
+    raise KeyError("Account not found")
+
+
+def update_account_profile(
+    account_id: str,
+    *,
+    display_name: str | None = None,
+    tags: list[str] | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    state = _read_raw_state()
+    for account in state["accounts"]:
+        if account.get("account_id") == account_id:
+            if display_name is not None:
+                account["display_name"] = display_name.strip() or account.get(
+                    "display_name",
+                    "DevEco 账号",
+                )
+            if tags is not None:
+                account["tags"] = _normalize_tags(tags)
+            if note is not None:
+                account["note"] = str(note).strip()[:500]
             account["updated_at"] = _now()
             _write_raw_state(state)
             return _account_public(account, state["active_account_id"])
@@ -353,6 +531,16 @@ def _model_count(data: dict[str, Any]) -> int:
     for group in data.get("body", {}).get("inner_models", []):
         count += len(group.get("model_configs", []))
     return count
+
+
+def _models(data: dict[str, Any]) -> list[dict[str, str]]:
+    models: list[dict[str, str]] = []
+    for group in data.get("body", {}).get("inner_models", []):
+        for cfg in group.get("model_configs", []):
+            model_id = cfg.get("model_id")
+            if model_id:
+                models.append({"id": str(model_id), "owned_by": "deveco"})
+    return models
 
 
 def _redact_error(message: str, account: dict[str, Any] | None) -> str:
@@ -424,3 +612,62 @@ async def check_account_connectivity(
         }
     update_account_connectivity(account_id, result)
     return result
+
+
+async def fetch_account_models(
+    account_id: str,
+    proxy: str | None = None,
+) -> dict[str, Any]:
+    account = get_account(account_id)
+    if not account:
+        raise KeyError("Account not found")
+
+    started = time.perf_counter()
+    checked_at = _now()
+    try:
+        async with _build_client(proxy=proxy, timeout=30.0) as client:
+            response = await client.get(
+                MODEL_CONFIG_URL,
+                headers={
+                    "Authorization": f"Bearer {account['access_token']}",
+                    "Content-Type": "application/json",
+                },
+            )
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        success = response.status_code == 200
+        body = response.json() if success else {}
+        models = _models(body) if success else []
+        connectivity = {
+            "success": success,
+            "status_code": response.status_code,
+            "latency_ms": latency_ms,
+            "model_count": len(models),
+            "checked_at": checked_at,
+            "error": None
+            if success
+            else _redact_error(response.text or "上游返回错误", account),
+        }
+        update_account_connectivity(account_id, connectivity)
+        return {
+            "account_id": account_id,
+            "account_name": account.get("display_name") or account.get("user_name"),
+            **connectivity,
+            "models": models,
+        }
+    except Exception as exc:
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        connectivity = {
+            "success": False,
+            "status_code": None,
+            "latency_ms": latency_ms,
+            "model_count": 0,
+            "checked_at": checked_at,
+            "error": _redact_error(str(exc) or "模型能力刷新失败", account),
+        }
+        update_account_connectivity(account_id, connectivity)
+        return {
+            "account_id": account_id,
+            "account_name": account.get("display_name") or account.get("user_name"),
+            **connectivity,
+            "models": [],
+        }

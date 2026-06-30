@@ -23,6 +23,8 @@ ENV_PORT = "HM_API_PORT"
 ENV_API_KEY = "HM_API_KEY"
 ENV_PROXY = "HM_API_PROXY"
 ENV_CRED_DIR = "HM_API_CRED_DIR"
+ENV_ACCOUNT_STRATEGY = "HM_API_ACCOUNT_STRATEGY"
+ACCOUNT_STRATEGIES = {"active_only", "round_robin", "failover"}
 
 
 def _env_value(name: str, default: str = "") -> str:
@@ -53,6 +55,17 @@ def get_default_proxy() -> str | None:
 
 def get_default_api_key() -> str | None:
     return _env_value(ENV_API_KEY) or None
+
+
+def normalize_account_strategy(value: str | None) -> str:
+    strategy = (value or "active_only").strip().lower()
+    if strategy not in ACCOUNT_STRATEGIES:
+        return "active_only"
+    return strategy
+
+
+def get_default_account_strategy() -> str:
+    return normalize_account_strategy(_env_value(ENV_ACCOUNT_STRATEGY, "active_only"))
 
 
 def get_cred_dir() -> Path:

@@ -9,6 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/app/.venv/bin:$PATH" \
     HM_API_HOST=0.0.0.0 \
     HM_API_PORT=8000 \
+    HM_API_ACCOUNT_STRATEGY=active_only \
     HM_API_CRED_DIR=/data/cred
 
 WORKDIR /app

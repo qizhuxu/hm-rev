@@ -527,6 +527,8 @@ def render_ui_html() -> str:
         <button class="active" data-tab="overview">总览<small>服务、账号、流量</small></button>
         <button data-tab="accounts">账号工作台<small>多账号、登录向导</small></button>
         <button data-tab="usage">请求透视<small>趋势、模型、错误</small></button>
+        <button data-tab="logs">日志流<small>自动刷新、定位最新</small></button>
+        <button data-tab="models">模型与能力<small>账号模型、复制 ID</small></button>
         <button data-tab="checks">连通性检测<small>批量检查、错误摘要</small></button>
         <button data-tab="settings">配置与安全<small>认证、持久化、示例</small></button>
       </nav>
@@ -750,6 +752,85 @@ def render_ui_html() -> str:
         </div>
       </section>
 
+      <section class="page" id="page-logs">
+        <div class="metrics">
+          <div class="metric"><div class="label">日志总数</div><div class="value" id="logTotal">0</div><div class="hint">usage.jsonl 元数据</div></div>
+          <div class="metric"><div class="label">当前展示</div><div class="value" id="logShown">0</div><div class="hint">最近记录窗口</div></div>
+          <div class="metric"><div class="label">自动刷新</div><div class="value" id="logAutoState">关闭</div><div class="hint">定位到最新记录</div></div>
+          <div class="metric"><div class="label">最新状态</div><div class="value" id="logLatestState">-</div><div class="hint">按最新一条计算</div></div>
+          <div class="metric"><div class="label">轮询策略</div><div class="value" id="logStrategy">active_only</div><div class="hint">当前账号调度</div></div>
+        </div>
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>日志流</h2>
+              <p class="panel-sub">展示最近请求元数据，自动刷新时会保持定位到最新记录，不包含聊天正文。</p>
+            </div>
+            <div class="top-actions">
+              <button id="refreshLogs" class="secondary">刷新日志</button>
+              <button id="scrollLatestLog" class="ghost">定位最新</button>
+            </div>
+          </div>
+          <div class="toolbar">
+            <label class="pill"><input id="autoRefreshLogs" type="checkbox" style="width:auto; min-height:auto;"> 自动刷新</label>
+            <input id="logSearch" placeholder="筛选账号、模型、接口或状态码">
+            <select id="logFilter" aria-label="日志状态筛选">
+              <option value="all">全部状态</option>
+              <option value="success">仅成功</option>
+              <option value="error">仅失败</option>
+              <option value="stream">仅流式</option>
+              <option value="nonstream">仅非流式</option>
+            </select>
+          </div>
+          <div id="logStreamTable"></div>
+          <div class="message" id="logMessage"></div>
+        </section>
+      </section>
+
+      <section class="page" id="page-models">
+        <div class="grid-2">
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>模型与能力</h2>
+                <p class="panel-sub">按账号刷新 DevEco 模型配置，展示模型 ID、状态、延迟和错误摘要。</p>
+              </div>
+              <div class="top-actions">
+                <button id="refreshModels">刷新能力</button>
+                <button id="loadModels" class="secondary">读取缓存</button>
+              </div>
+            </div>
+            <label for="modelAccountTarget">刷新范围</label>
+            <select id="modelAccountTarget"><option value="">全部账号</option></select>
+            <div id="modelCapabilities" style="margin-top: 10px;"></div>
+            <div class="message" id="modelMessage"></div>
+          </section>
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>账号调度策略</h2>
+                <p class="panel-sub">控制 /v1/models 与 /v1/chat/completions 如何选择账号。</p>
+              </div>
+            </div>
+            <label for="accountStrategy">当前策略</label>
+            <select id="accountStrategy">
+              <option value="active_only">仅当前启用账号</option>
+              <option value="round_robin">多账号轮询</option>
+              <option value="failover">失败自动切换</option>
+            </select>
+            <div class="toolbar">
+              <button id="saveStrategy">保存策略</button>
+            </div>
+            <div class="health-list">
+              <div class="health-item"><span>active_only</span><span class="pill">兼容旧行为</span></div>
+              <div class="health-item"><span>round_robin</span><span class="pill warn">按请求轮询健康账号</span></div>
+              <div class="health-item"><span>failover</span><span class="pill warn">失败后尝试备用账号</span></div>
+            </div>
+            <div class="message" id="strategyMessage"></div>
+          </section>
+        </div>
+      </section>
+
       <section class="page" id="page-checks">
         <div class="metrics">
           <div class="metric"><div class="label">连通正常</div><div class="value" id="cOk">0</div><div class="hint">最近一次检测成功</div></div>
@@ -813,6 +894,17 @@ def render_ui_html() -> str:
             <pre class="mono">curl http://127.0.0.1:8000/v1/models \\
   -H "Authorization: Bearer &lt;HM_API_KEY&gt;"</pre>
           </section>
+          <section class="panel">
+            <div class="panel-head"><div><h2>接入配置</h2><p class="panel-sub">一键复制 OpenAI SDK 与 curl 使用文档，始终使用密钥占位符。</p></div></div>
+            <div class="toolbar">
+              <button id="copyPythonConfig" class="secondary">复制 Python SDK</button>
+              <button id="copyJsConfig" class="secondary">复制 JavaScript SDK</button>
+              <button id="copyModelsCurl" class="secondary">复制模型 curl</button>
+              <button id="copyChatCurl" class="secondary">复制聊天 curl</button>
+            </div>
+            <pre id="integrationPreview" class="mono"></pre>
+            <div class="message" id="integrationMessage"></div>
+          </section>
         </div>
       </section>
     </main>
@@ -829,6 +921,12 @@ def render_ui_html() -> str:
       accountSearch: "",
       requestSearch: "",
       requestFilter: "all",
+      logs: [],
+      logSearch: "",
+      logFilter: "all",
+      autoRefreshLogs: false,
+      logTimer: null,
+      modelResults: [],
       checkSearch: "",
       checkFilter: "all",
     };
@@ -836,6 +934,8 @@ def render_ui_html() -> str:
       overview: ["总览", "集中查看服务就绪度、当前账号、请求统计和最近调用。"],
       accounts: ["账号工作台", "管理多个 DevEco 账号，并通过登录向导保存或覆盖账号。"],
       usage: ["请求透视", "按趋势、模型、账号和最近流水检查本地请求元数据。"],
+      logs: ["日志流", "自动刷新最近请求流水，并快速定位到最新记录。"],
+      models: ["模型与能力", "查看账号模型能力、刷新可用模型并配置账号调度策略。"],
       checks: ["连通性检测", "手动检测账号是否能访问 DevEco 模型配置，并查看脱敏错误摘要。"],
       settings: ["配置与安全", "查看认证、凭据目录、持久化文件和安全边界。"],
     };
@@ -895,6 +995,54 @@ def render_ui_html() -> str:
       if (health === "ok") return pill("连通正常", "ok");
       if (health === "fail") return pill("连通失败", "bad");
       return pill("未检测", "warn");
+    }
+    function tagPills(tags) {
+      const items = Array.isArray(tags) ? tags : [];
+      if (!items.length) return pill("未加标签");
+      return items.map(tag => pill(tag, "warn")).join("");
+    }
+    function baseUrl() {
+      return `${window.location.origin}`;
+    }
+    function integrationSnippet(kind) {
+      const url = baseUrl();
+      const model = "GLM-5.1";
+      if (kind === "python") {
+        return `from openai import OpenAI
+
+client = OpenAI(
+    api_key="<HM_API_KEY>",
+    base_url="${url}/v1",
+)
+
+response = client.chat.completions.create(
+    model="${model}",
+    messages=[{"role": "user", "content": "你好"}],
+)
+print(response.choices[0].message.content)`;
+      }
+      if (kind === "js") {
+        return `import OpenAI from "openai";
+
+const client = new OpenAI({
+  apiKey: "<HM_API_KEY>",
+  baseURL: "${url}/v1",
+});
+
+const response = await client.chat.completions.create({
+  model: "${model}",
+  messages: [{ role: "user", content: "你好" }],
+});
+console.log(response.choices[0].message.content);`;
+      }
+      if (kind === "models") {
+        return `curl ${url}/v1/models \\
+  -H "Authorization: Bearer <HM_API_KEY>"`;
+      }
+      return `curl ${url}/v1/chat/completions \\
+  -H "Authorization: Bearer <HM_API_KEY>" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"${model}","messages":[{"role":"user","content":"你好"}]}'`;
     }
     async function copyText(value) {
       if (!value) return;
@@ -1021,6 +1169,17 @@ def render_ui_html() -> str:
         select.value = current;
       }
     }
+    function renderModelAccountOptions() {
+      const select = $("modelAccountTarget");
+      const current = select.value;
+      const options = ['<option value="">全部账号</option>'].concat(
+        state.accounts.map(account => `<option value="${esc(account.account_id)}">${esc(account.display_name || account.user_name || account.account_id)}</option>`)
+      );
+      select.innerHTML = options.join("");
+      if (state.accounts.some(account => account.account_id === current)) {
+        select.value = current;
+      }
+    }
     function filteredAccounts() {
       const query = state.accountSearch.trim().toLowerCase();
       return state.accounts.filter(account => {
@@ -1029,6 +1188,8 @@ def render_ui_html() -> str:
           account.user_name,
           account.user_id,
           account.account_id,
+          account.note,
+          ...(account.tags || []),
         ].some(value => String(value || "").toLowerCase().includes(query));
         const health = accountHealth(account);
         const matchesFilter =
@@ -1055,6 +1216,7 @@ def render_ui_html() -> str:
           <div class="account-main">
             <div class="account-title">${esc(account.display_name || "DevEco 账号")} ${accountStatus(account)} ${healthPill(account)}</div>
             <span class="muted">${esc(account.user_name || account.user_id || "未知用户")}</span>
+            <span class="pill-row">${tagPills(account.tags)}</span>
             <span class="mono">${esc(account.account_id)}</span>
           </div>
           <div class="row-actions">
@@ -1078,6 +1240,7 @@ def render_ui_html() -> str:
         <div class="account-main">
           <div class="account-title">${esc(account.display_name || "DevEco 账号")} ${accountStatus(account)} ${healthPill(account)}</div>
           <span class="muted">${esc(account.user_name || account.user_id || "未知用户")}</span>
+          <span class="pill-row">${tagPills(account.tags)}</span>
           <span class="mono">${esc(account.account_id)}</span>
         </div>
         <div class="detail-grid">
@@ -1090,6 +1253,13 @@ def render_ui_html() -> str:
           <div class="detail-item"><span>延迟</span>${check.latency_ms === undefined || check.latency_ms === null ? "-" : `${esc(check.latency_ms)}ms`}</div>
           <div class="detail-item"><span>错误摘要</span>${text(check.error)}</div>
         </div>
+        <label for="profileDisplayName">显示名</label>
+        <input id="profileDisplayName" value="${esc(account.display_name || "")}">
+        <label for="profileTags">账号标签</label>
+        <input id="profileTags" value="${esc((account.tags || []).join(", "))}" placeholder="例如：生产, 主力">
+        <label for="profileNote">备注</label>
+        <textarea id="profileNote" spellcheck="false" placeholder="仅保存本地说明，不参与上游请求">${esc(account.note || "")}</textarea>
+        <button data-action="saveProfile" data-id="${esc(account.account_id)}">保存标签与备注</button>
       `;
     }
     function renderUsage() {
@@ -1144,6 +1314,79 @@ def render_ui_html() -> str:
         {label: "模式", render: row => row.stream ? pill("流式") : pill("非流式")},
         {label: "延迟", render: row => `${text(row.latency_ms || 0)}ms`},
       ]);
+    }
+    function filteredLogs() {
+      const query = state.logSearch.trim().toLowerCase();
+      return state.logs.filter(row => {
+        const matchesFilter =
+          state.logFilter === "all" ||
+          (state.logFilter === "success" && row.success) ||
+          (state.logFilter === "error" && !row.success) ||
+          (state.logFilter === "stream" && row.stream) ||
+          (state.logFilter === "nonstream" && !row.stream);
+        const haystack = [
+          row.timestamp,
+          row.endpoint,
+          row.model,
+          row.status_code,
+          row.account_id,
+          accountName(row.account_id),
+        ].join(" ").toLowerCase();
+        return matchesFilter && (!query || haystack.includes(query));
+      });
+    }
+    function renderLogs() {
+      const logs = filteredLogs();
+      $("logTotal").textContent = state.logTotal || state.logs.length || 0;
+      $("logShown").textContent = logs.length;
+      $("logAutoState").textContent = state.autoRefreshLogs ? "开启" : "关闭";
+      $("logStrategy").textContent = (state.overview && state.overview.account_strategy) || "active_only";
+      const latest = state.logs[0];
+      $("logLatestState").textContent = latest ? (latest.success ? "成功" : "失败") : "-";
+      $("logStreamTable").innerHTML = table(logs, [
+        {label: "时间", render: row => text(shortTime(row.timestamp))},
+        {label: "账号", render: row => text(accountName(row.account_id))},
+        {label: "接口", render: row => text(row.endpoint)},
+        {label: "模型", render: row => text(row.model || "上游未返回")},
+        {label: "状态", render: row => row.success ? pill(`成功 ${row.status_code || ""}`, "ok") : pill(`失败 ${row.status_code || ""}`, "bad")},
+        {label: "模式", render: row => row.stream ? pill("流式") : pill("非流式")},
+        {label: "延迟", render: row => `${text(row.latency_ms || 0)}ms`},
+      ]);
+    }
+    function scrollLatestLog() {
+      const table = $("logStreamTable");
+      if (table) table.scrollIntoView({block: "start", behavior: "smooth"});
+    }
+    function renderModels() {
+      renderModelAccountOptions();
+      $("accountStrategy").value = (state.overview && state.overview.account_strategy) || "active_only";
+      const rows = state.modelResults.length
+        ? state.modelResults
+        : state.accounts.map(account => ({
+            account_id: account.account_id,
+            account_name: account.display_name || account.user_name || account.account_id,
+            success: account.connectivity && account.connectivity.success,
+            status_code: account.connectivity && account.connectivity.status_code,
+            latency_ms: account.connectivity && account.connectivity.latency_ms,
+            checked_at: account.connectivity && account.connectivity.checked_at,
+            model_count: account.connectivity && account.connectivity.model_count,
+            models: [],
+            error: account.connectivity && account.connectivity.error,
+          }));
+      $("modelCapabilities").innerHTML = table(rows, [
+        {label: "账号", render: row => `${text(row.account_name)}<br><span class="mono muted">${text(row.account_id)}</span>`},
+        {label: "结果", render: row => row.success ? pill("可用", "ok") : (row.checked_at ? pill("异常", "bad") : pill("未刷新", "warn"))},
+        {label: "HTTP", render: row => text(row.status_code)},
+        {label: "延迟", render: row => row.latency_ms === undefined || row.latency_ms === null ? "-" : `${text(row.latency_ms)}ms`},
+        {label: "最近检测", render: row => text(shortTime(row.checked_at))},
+        {label: "模型", render: row => (row.models || []).length
+          ? (row.models || []).map(model => `<button class="secondary" data-action="copyModel" data-id="${esc(model.id)}">${esc(model.id)}</button>`).join(" ")
+          : text(row.model_count || 0)},
+        {label: "错误摘要", render: row => text(row.error)},
+      ]);
+    }
+    function renderIntegration() {
+      $("integrationPreview").textContent = integrationSnippet("python");
     }
     function renderChecks() {
       const ok = state.accounts.filter(account => accountHealth(account) === "ok").length;
@@ -1219,8 +1462,11 @@ def render_ui_html() -> str:
       renderRecentOverview();
       renderAccounts();
       renderUsage();
+      renderLogs();
+      renderModels();
       renderChecks();
       renderSettings();
+      renderIntegration();
     }
     async function loadOverview() {
       setLoadState("正在读取管理数据...");
@@ -1259,6 +1505,59 @@ def render_ui_html() -> str:
       renderAccounts();
       renderChecks();
       renderAccountTargetOptions();
+      renderModelAccountOptions();
+    }
+    async function loadLogs(keepPosition = false) {
+      const response = await api("/ui/api/usage/events?limit=100", {method: "GET", headers: {}});
+      if (!response.ok) {
+        setMessage("logMessage", "日志读取失败", false);
+        return;
+      }
+      const data = await readJson(response);
+      state.logs = data.events || [];
+      state.logTotal = data.total || state.logs.length;
+      renderLogs();
+      if (!keepPosition) scrollLatestLog();
+    }
+    async function loadModels() {
+      const response = await api("/ui/api/models", {method: "GET", headers: {}});
+      if (!response.ok) {
+        setMessage("modelMessage", "模型能力缓存读取失败", false);
+        return;
+      }
+      state.modelResults = [];
+      renderModels();
+    }
+    async function refreshModels() {
+      setMessage("modelMessage", "正在刷新模型能力...", true);
+      const response = await api("/ui/api/models/refresh", {
+        method: "POST",
+        body: JSON.stringify({account_id: $("modelAccountTarget").value || null}),
+      });
+      const data = await readJson(response);
+      if (!response.ok) {
+        setMessage("modelMessage", data.detail || "模型能力刷新失败", false);
+        return;
+      }
+      state.modelResults = data.results || [];
+      renderModels();
+      setMessage("modelMessage", "模型能力刷新完成", true);
+      await loadOverview();
+    }
+    async function saveStrategy() {
+      const response = await api("/ui/api/account-strategy", {
+        method: "PUT",
+        body: JSON.stringify({strategy: $("accountStrategy").value}),
+      });
+      const data = await readJson(response);
+      if (!response.ok) {
+        setMessage("strategyMessage", data.detail || "策略保存失败", false);
+        return;
+      }
+      if (state.overview) state.overview.account_strategy = data.strategy;
+      setMessage("strategyMessage", "账号调度策略已保存", true);
+      renderModels();
+      renderLogs();
     }
     async function activateAccount(id) {
       await api(`/ui/api/accounts/${encodeURIComponent(id)}/activate`, {method: "POST"});
@@ -1272,6 +1571,23 @@ def render_ui_html() -> str:
         method: "PATCH",
         body: JSON.stringify({display_name: displayName.trim()}),
       });
+      state.selectedAccountId = id;
+      await loadOverview();
+    }
+    async function saveAccountProfile(id) {
+      const tags = $("profileTags").value
+        .split(",")
+        .map(item => item.trim())
+        .filter(Boolean);
+      const response = await api(`/ui/api/accounts/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          display_name: $("profileDisplayName").value,
+          tags,
+          note: $("profileNote").value,
+        }),
+      });
+      setMessage("accountMessage", response.ok ? "账号标签与备注已保存" : "账号标签与备注保存失败", response.ok);
       state.selectedAccountId = id;
       await loadOverview();
     }
@@ -1313,7 +1629,12 @@ def render_ui_html() -> str:
       }
       if (target.dataset.action === "activate") activateAccount(id);
       if (target.dataset.action === "rename") renameAccount(id);
+      if (target.dataset.action === "saveProfile") saveAccountProfile(id);
       if (target.dataset.action === "check") checkOne(id);
+      if (target.dataset.action === "copyModel") {
+        copyText(id);
+        setMessage("modelMessage", "模型 ID 已复制", true);
+      }
       if (target.dataset.action === "delete") deleteAccount(id);
     });
     $("reloadAll").addEventListener("click", loadOverview);
@@ -1344,6 +1665,41 @@ def render_ui_html() -> str:
       state.requestFilter = event.target.value;
       renderRecentUsageTable();
     });
+    $("refreshLogs").addEventListener("click", () => loadLogs(false));
+    $("scrollLatestLog").addEventListener("click", scrollLatestLog);
+    $("autoRefreshLogs").addEventListener("change", event => {
+      state.autoRefreshLogs = event.target.checked;
+      if (state.logTimer) {
+        window.clearInterval(state.logTimer);
+        state.logTimer = null;
+      }
+      if (state.autoRefreshLogs) {
+        state.logTimer = window.setInterval(() => loadLogs(true), 5000);
+        loadLogs(false);
+      }
+      renderLogs();
+    });
+    $("logSearch").addEventListener("input", event => {
+      state.logSearch = event.target.value;
+      renderLogs();
+    });
+    $("logFilter").addEventListener("change", event => {
+      state.logFilter = event.target.value;
+      renderLogs();
+    });
+    $("loadModels").addEventListener("click", loadModels);
+    $("refreshModels").addEventListener("click", refreshModels);
+    $("saveStrategy").addEventListener("click", saveStrategy);
+    function copyIntegration(kind) {
+      const snippet = integrationSnippet(kind);
+      $("integrationPreview").textContent = snippet;
+      copyText(snippet);
+      setMessage("integrationMessage", "接入配置已复制", true);
+    }
+    $("copyPythonConfig").addEventListener("click", () => copyIntegration("python"));
+    $("copyJsConfig").addEventListener("click", () => copyIntegration("js"));
+    $("copyModelsCurl").addEventListener("click", () => copyIntegration("models"));
+    $("copyChatCurl").addEventListener("click", () => copyIntegration("chat"));
     $("checkSearch").addEventListener("input", event => {
       state.checkSearch = event.target.value;
       renderChecks();

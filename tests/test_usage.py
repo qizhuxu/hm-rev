@@ -1,7 +1,7 @@
 import json
 
 from hm_api.config import get_usage_file
-from hm_api.usage import get_usage_summary, record_usage_event
+from hm_api.usage import get_usage_events, get_usage_summary, record_usage_event
 
 
 def test_usage_records_metadata_without_message_content(monkeypatch, tmp_path):
@@ -60,3 +60,27 @@ def test_usage_summary_groups_by_account_and_model(monkeypatch, tmp_path):
     assert summary["by_account"]["acc-1"]["requests"] == 2
     assert summary["by_model"]["GLM-5.1"]["requests"] == 1
     assert len(summary["recent"]) == 2
+
+
+def test_usage_events_returns_recent_metadata_with_limit(monkeypatch, tmp_path):
+    monkeypatch.setenv("HM_API_CRED_DIR", str(tmp_path / "cred"))
+
+    for index in range(3):
+        record_usage_event(
+            account_id=f"acc-{index}",
+            endpoint="/v1/chat/completions",
+            request_body={
+                "model": f"model-{index}",
+                "messages": [{"role": "user", "content": "不要保存正文"}],
+            },
+            status_code=200,
+            latency_ms=10 + index,
+            success=True,
+        )
+
+    events = get_usage_events(limit=2)
+
+    assert [event["account_id"] for event in events["events"]] == ["acc-2", "acc-1"]
+    assert events["total"] == 3
+    assert events["limit"] == 2
+    assert "不要保存正文" not in json.dumps(events, ensure_ascii=False)

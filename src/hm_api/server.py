@@ -11,7 +11,7 @@ from typing import Any
 from typing import AsyncGenerator
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -19,16 +19,21 @@ from .accounts import (
     activate_account,
     check_account_connectivity,
     delete_account,
+    fetch_account_models,
     get_active_account,
+    get_account_strategy,
     list_accounts,
     load_account_state,
     mark_account_used,
     rename_account,
+    select_account_candidates,
+    set_account_strategy,
+    update_account_profile,
 )
 from .config import DEVECO_BASE_URL, DEVECO_DEFAULT_AUTH_PORT, USER_AGENT, get_cred_dir
 from .login import complete_manual_login, create_login_challenge, is_logged_in, load_session
 from .ui import render_ui_html
-from .usage import get_usage_summary, record_usage_event
+from .usage import get_usage_events, get_usage_summary, record_usage_event
 
 
 TARGET_BASE = f"{DEVECO_BASE_URL}/sse/codeGenie/maas"
@@ -46,10 +51,22 @@ class ManualCallbackRequest(BaseModel):
 class AccountManualCallbackRequest(ManualCallbackRequest):
     display_name: str | None = Field(default=None, max_length=128)
     account_id: str | None = Field(default=None, max_length=128)
+    tags: list[str] = Field(default_factory=list, max_length=12)
+    note: str | None = Field(default=None, max_length=500)
 
 
 class RenameAccountRequest(BaseModel):
-    display_name: str = Field(..., min_length=1, max_length=128)
+    display_name: str | None = Field(default=None, min_length=1, max_length=128)
+    tags: list[str] | None = Field(default=None, max_length=12)
+    note: str | None = Field(default=None, max_length=500)
+
+
+class AccountStrategyRequest(BaseModel):
+    strategy: str = Field(..., min_length=1, max_length=32)
+
+
+class ModelRefreshRequest(BaseModel):
+    account_id: str | None = Field(default=None, max_length=128)
 
 
 def _current_account() -> dict[str, Any] | None:
@@ -65,6 +82,26 @@ def _current_access_token() -> str | None:
         return None
     access = account.get("access_token")
     return str(access) if access else None
+
+
+def _account_candidates() -> tuple[str, list[dict[str, Any]]]:
+    strategy = get_account_strategy()
+    accounts = select_account_candidates(strategy)
+    return strategy, accounts
+
+
+def _can_try_next(strategy: str, index: int, accounts: list[dict[str, Any]]) -> bool:
+    return strategy == "failover" and index < len(accounts) - 1
+
+
+def _model_list(data: dict[str, Any]) -> list[dict[str, str]]:
+    models: list[dict[str, str]] = []
+    for group in data.get("body", {}).get("inner_models", []):
+        for cfg in group.get("model_configs", []):
+            model_id = cfg.get("model_id")
+            if model_id:
+                models.append({"id": str(model_id), "object": "model", "owned_by": "deveco"})
+    return models
 
 
 def _redact_sensitive(message: str, account: dict[str, Any] | None = None) -> str:
@@ -107,6 +144,7 @@ def _overview_payload(api_key: str | None) -> dict[str, Any]:
             "exists": cred_dir.exists(),
         },
         "credential_files": credential_files,
+        "account_strategy": get_account_strategy(),
         "active_account": active_account,
         "active_account_id": state["active_account_id"],
         "accounts": accounts,
@@ -206,6 +244,15 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
     async def ui_overview() -> JSONResponse:
         return JSONResponse(_overview_payload(api_key))
 
+    @app.get("/ui/api/account-strategy", response_model=None)
+    async def ui_account_strategy() -> JSONResponse:
+        return JSONResponse({"strategy": get_account_strategy()})
+
+    @app.put("/ui/api/account-strategy", response_model=None)
+    async def ui_account_strategy_update(payload: AccountStrategyRequest) -> JSONResponse:
+        strategy = set_account_strategy(payload.strategy)
+        return JSONResponse({"success": True, "strategy": strategy})
+
     @app.get("/ui/api/accounts", response_model=None)
     async def ui_accounts() -> JSONResponse:
         state = load_account_state()
@@ -215,6 +262,42 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
                 "accounts": state["accounts"],
             }
         )
+
+    @app.get("/ui/api/models", response_model=None)
+    async def ui_models() -> JSONResponse:
+        accounts = list_accounts()
+        return JSONResponse(
+            {
+                "accounts": [
+                    {
+                        "account_id": account.get("account_id"),
+                        "account_name": account.get("display_name")
+                        or account.get("user_name")
+                        or account.get("account_id"),
+                        "connectivity": account.get("connectivity"),
+                        "models": [],
+                    }
+                    for account in accounts
+                ]
+            }
+        )
+
+    @app.post("/ui/api/models/refresh", response_model=None)
+    async def ui_models_refresh(payload: ModelRefreshRequest) -> JSONResponse:
+        target_accounts = (
+            [account for account in list_accounts() if account.get("account_id") == payload.account_id]
+            if payload.account_id
+            else list_accounts()
+        )
+        if payload.account_id and not target_accounts:
+            raise HTTPException(status_code=404, detail="Account not found")
+        results: list[dict[str, Any]] = []
+        for account in target_accounts:
+            account_id = str(account.get("account_id") or "")
+            if not account_id:
+                continue
+            results.append(await fetch_account_models(account_id, proxy=proxy))
+        return JSONResponse({"success": True, "results": results})
 
     @app.post("/ui/api/accounts/login-url", response_model=None)
     async def ui_account_login_url(payload: LoginUrlRequest) -> JSONResponse:
@@ -248,6 +331,12 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
                 },
                 status_code=400,
             )
+        if result.account_id and (payload.tags or payload.note):
+            update_account_profile(
+                result.account_id,
+                tags=payload.tags,
+                note=payload.note,
+            )
         return JSONResponse(
             {
                 "success": True,
@@ -275,7 +364,15 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
         payload: RenameAccountRequest,
     ) -> JSONResponse:
         try:
-            account = rename_account(account_id, payload.display_name.strip())
+            if payload.tags is None and payload.note is None and payload.display_name:
+                account = rename_account(account_id, payload.display_name.strip())
+            else:
+                account = update_account_profile(
+                    account_id,
+                    display_name=payload.display_name,
+                    tags=payload.tags,
+                    note=payload.note,
+                )
         except KeyError:
             raise HTTPException(status_code=404, detail="Account not found")
         return JSONResponse({"success": True, "account": account})
@@ -314,11 +411,18 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
     async def ui_usage() -> JSONResponse:
         return JSONResponse(get_usage_summary())
 
+    @app.get("/ui/api/usage/events", response_model=None)
+    async def ui_usage_events(
+        limit: int = Query(default=50, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+    ) -> JSONResponse:
+        return JSONResponse(get_usage_events(limit=limit, offset=offset))
+
     @app.get("/v1/models", response_model=None)
     async def list_models() -> JSONResponse:
         started = time.perf_counter()
-        account = _current_account()
-        if not account:
+        strategy, accounts = _account_candidates()
+        if not accounts:
             record_usage_event(
                 account_id=None,
                 endpoint="/v1/models",
@@ -328,61 +432,70 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
                 success=False,
             )
             raise HTTPException(status_code=401, detail="Not logged in")
-        token = str(account["access_token"])
-        resp = await client.get(
-            f"{DEVECO_BASE_URL}/codeGenie/modelConfig?localVersion=0&pluginVersion=CLI.0.1.0",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-        )
-        latency_ms = int((time.perf_counter() - started) * 1000)
-        if resp.status_code != 200:
+        last_error: HTTPException | None = None
+        for index, account in enumerate(accounts):
+            mark_account_used(str(account["account_id"]))
+            token = str(account["access_token"])
+            resp = await client.get(
+                f"{DEVECO_BASE_URL}/codeGenie/modelConfig?localVersion=0&pluginVersion=CLI.0.1.0",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            if resp.status_code != 200:
+                record_usage_event(
+                    account_id=str(account["account_id"]),
+                    endpoint="/v1/models",
+                    request_body={},
+                    status_code=resp.status_code,
+                    latency_ms=latency_ms,
+                    success=False,
+                )
+                last_error = HTTPException(
+                    status_code=resp.status_code,
+                    detail=_redact_sensitive(resp.text, account),
+                )
+                if _can_try_next(strategy, index, accounts):
+                    continue
+                raise last_error
+            try:
+                data = resp.json()
+            except ValueError:
+                record_usage_event(
+                    account_id=str(account["account_id"]),
+                    endpoint="/v1/models",
+                    request_body={},
+                    status_code=502,
+                    latency_ms=latency_ms,
+                    success=False,
+                )
+                last_error = HTTPException(
+                    status_code=502,
+                    detail="Invalid upstream response",
+                )
+                if _can_try_next(strategy, index, accounts):
+                    continue
+                raise last_error
+            models = _model_list(data)
             record_usage_event(
                 account_id=str(account["account_id"]),
                 endpoint="/v1/models",
                 request_body={},
                 status_code=resp.status_code,
                 latency_ms=latency_ms,
-                success=False,
+                success=True,
             )
-            raise HTTPException(
-                status_code=resp.status_code,
-                detail=_redact_sensitive(resp.text, account),
-            )
-        try:
-            data = resp.json()
-        except ValueError:
-            record_usage_event(
-                account_id=str(account["account_id"]),
-                endpoint="/v1/models",
-                request_body={},
-                status_code=502,
-                latency_ms=latency_ms,
-                success=False,
-            )
-            raise HTTPException(status_code=502, detail="Invalid upstream response")
-        models: list[dict] = []
-        for group in data.get("body", {}).get("inner_models", []):
-            for cfg in group.get("model_configs", []):
-                model_id = cfg.get("model_id")
-                if model_id:
-                    models.append({"id": model_id, "object": "model", "owned_by": "deveco"})
-        record_usage_event(
-            account_id=str(account["account_id"]),
-            endpoint="/v1/models",
-            request_body={},
-            status_code=resp.status_code,
-            latency_ms=latency_ms,
-            success=True,
-        )
-        return JSONResponse({"object": "list", "data": models})
+            return JSONResponse({"object": "list", "data": models})
+        assert last_error is not None
+        raise last_error
 
     @app.post("/v1/chat/completions", response_model=None)
     async def chat_completions(request: Request) -> StreamingResponse | JSONResponse:
         started = time.perf_counter()
-        account = _current_account()
-        if not account:
+        strategy, accounts = _account_candidates()
+        if not accounts:
             record_usage_event(
                 account_id=None,
                 endpoint="/v1/chat/completions",
@@ -392,7 +505,6 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
                 success=False,
             )
             raise HTTPException(status_code=401, detail="Not logged in")
-        token = str(account["access_token"])
 
         body_bytes = await request.body()
         if not body_bytes:
@@ -401,7 +513,7 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
             body_json = json.loads(body_bytes)
         except json.JSONDecodeError:
             record_usage_event(
-                account_id=str(account["account_id"]),
+                account_id=str(accounts[0]["account_id"]),
                 endpoint="/v1/chat/completions",
                 request_body={},
                 status_code=400,
@@ -419,14 +531,13 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
         session_id = request.headers.get("x-deveco-session") or request.headers.get("x-session-affinity")
         chat_id = uuid.uuid4().hex.replace("-", "")
 
-        upstream_headers = {
-            "Authorization": f"Bearer {token}",
+        base_headers = {
             "Content-Type": "application/json",
             "lang": "en",
             "Chat-Id": chat_id,
         }
         if session_id:
-            upstream_headers["Session-Id"] = session_id
+            base_headers["Session-Id"] = session_id
 
         for key, value in request.headers.items():
             lower = key.lower()
@@ -439,41 +550,54 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
                 "accept-encoding",
             }:
                 continue
-            upstream_headers[key] = value
+            base_headers[key] = value
+
+        def headers_for(account: dict[str, Any]) -> dict[str, str]:
+            return {
+                **base_headers,
+                "Authorization": f"Bearer {account['access_token']}",
+            }
 
         if stream:
             async def streamer() -> AsyncGenerator[bytes, None]:
-                status_code = 502
-                success = False
-                try:
-                    async with client.stream(
-                        "POST",
-                        url,
-                        headers=upstream_headers,
-                        content=body_bytes,
-                    ) as upstream_resp:
-                        status_code = upstream_resp.status_code
-                        if upstream_resp.status_code != 200:
-                            text = await upstream_resp.aread()
-                            error = _redact_sensitive(
-                                text.decode("utf-8", errors="replace")
-                                or "Upstream error",
-                                account,
-                            )
-                            yield json.dumps({"error": error}).encode()
-                            return
-                        success = True
-                        async for chunk in upstream_resp.aiter_bytes():
-                            yield chunk
-                finally:
-                    record_usage_event(
-                        account_id=str(account["account_id"]),
-                        endpoint="/v1/chat/completions",
-                        request_body=body_json,
-                        status_code=status_code,
-                        latency_ms=int((time.perf_counter() - started) * 1000),
-                        success=success,
-                    )
+                last_error = "Upstream error"
+                for index, account in enumerate(accounts):
+                    mark_account_used(str(account["account_id"]))
+                    status_code = 502
+                    success = False
+                    try:
+                        async with client.stream(
+                            "POST",
+                            url,
+                            headers=headers_for(account),
+                            content=body_bytes,
+                        ) as upstream_resp:
+                            status_code = upstream_resp.status_code
+                            if upstream_resp.status_code != 200:
+                                text = await upstream_resp.aread()
+                                last_error = _redact_sensitive(
+                                    text.decode("utf-8", errors="replace")
+                                    or "Upstream error",
+                                    account,
+                                )
+                            else:
+                                success = True
+                                async for chunk in upstream_resp.aiter_bytes():
+                                    yield chunk
+                                return
+                    finally:
+                        record_usage_event(
+                            account_id=str(account["account_id"]),
+                            endpoint="/v1/chat/completions",
+                            request_body=body_json,
+                            status_code=status_code,
+                            latency_ms=int((time.perf_counter() - started) * 1000),
+                            success=success,
+                        )
+                    if _can_try_next(strategy, index, accounts):
+                        continue
+                    yield json.dumps({"error": last_error}).encode()
+                    return
 
             return StreamingResponse(
                 streamer(),
@@ -482,46 +606,75 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
                 headers={"Cache-Control": "no-cache"},
             )
 
-        upstream_resp = await client.post(url, headers=upstream_headers, content=body_bytes)
-        latency_ms = int((time.perf_counter() - started) * 1000)
+        last_error_response: JSONResponse | None = None
+        for index, account in enumerate(accounts):
+            mark_account_used(str(account["account_id"]))
+            upstream_resp = await client.post(
+                url,
+                headers=headers_for(account),
+                content=body_bytes,
+            )
+            latency_ms = int((time.perf_counter() - started) * 1000)
 
-        if upstream_resp.status_code != 200:
+            if upstream_resp.status_code != 200:
+                record_usage_event(
+                    account_id=str(account["account_id"]),
+                    endpoint="/v1/chat/completions",
+                    request_body=body_json,
+                    status_code=upstream_resp.status_code,
+                    latency_ms=latency_ms,
+                    success=False,
+                )
+                last_error_response = JSONResponse(
+                    content={
+                        "error": _redact_sensitive(
+                            upstream_resp.text or "Upstream error",
+                            account,
+                        )
+                    },
+                    status_code=upstream_resp.status_code,
+                )
+                if _can_try_next(strategy, index, accounts):
+                    continue
+                return last_error_response
+
+            response_content: dict[str, Any]
+            if upstream_resp.headers.get("content-type", "").startswith("application/json"):
+                try:
+                    response_content = upstream_resp.json()
+                except ValueError:
+                    record_usage_event(
+                        account_id=str(account["account_id"]),
+                        endpoint="/v1/chat/completions",
+                        request_body=body_json,
+                        status_code=502,
+                        latency_ms=latency_ms,
+                        success=False,
+                    )
+                    last_error_response = JSONResponse(
+                        content={"error": "Invalid upstream response"},
+                        status_code=502,
+                    )
+                    if _can_try_next(strategy, index, accounts):
+                        continue
+                    return last_error_response
+            else:
+                response_content = {"data": upstream_resp.text}
             record_usage_event(
                 account_id=str(account["account_id"]),
                 endpoint="/v1/chat/completions",
                 request_body=body_json,
                 status_code=upstream_resp.status_code,
                 latency_ms=latency_ms,
-                success=False,
+                success=True,
+                usage=_usage_payload(response_content),
             )
             return JSONResponse(
-                content={
-                    "error": _redact_sensitive(
-                        upstream_resp.text or "Upstream error",
-                        account,
-                    )
-                },
+                content=response_content,
                 status_code=upstream_resp.status_code,
             )
-
-        response_content: dict[str, Any]
-        if upstream_resp.headers.get("content-type", "").startswith("application/json"):
-            response_content = upstream_resp.json()
-        else:
-            response_content = {"data": upstream_resp.text}
-        record_usage_event(
-            account_id=str(account["account_id"]),
-            endpoint="/v1/chat/completions",
-            request_body=body_json,
-            status_code=upstream_resp.status_code,
-            latency_ms=latency_ms,
-            success=True,
-            usage=_usage_payload(response_content),
-        )
-        return JSONResponse(
-            content=response_content,
-            status_code=upstream_resp.status_code,
-        )
+        assert last_error_response is not None
+        return last_error_response
 
     return app
 

@@ -87,6 +87,19 @@ def _read_events() -> list[dict[str, Any]]:
     return events
 
 
+def get_usage_events(limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    limit = min(max(int(limit), 1), 500)
+    offset = max(int(offset), 0)
+    events = list(reversed(_read_events()))
+    page = events[offset : offset + limit]
+    return {
+        "events": page,
+        "total": len(events),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
 def _bucket() -> dict[str, Any]:
     return {"requests": 0, "success": 0, "errors": 0, "average_latency_ms": 0}
 

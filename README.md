@@ -11,10 +11,11 @@
 ## 功能特性
 
 - DevEco OAuth 登录，支持本地回调和手动粘贴回调地址。
-- 多账号管理：新增、覆盖、启用、重命名、删除账号。
+- 多账号管理：新增、覆盖、启用、重命名、删除账号，并支持标签与备注。
+- 多账号调度：支持仅当前账号、轮询账号、失败自动切换三种策略。
 - 本地 AES-GCM 加密保存凭据。
 - OpenAI 兼容 `/v1/models` 与 `/v1/chat/completions`。
-- 中文管理 UI：总览、账号工作台、请求统计、连通性检测、配置与安全信息。
+- 中文管理 UI：总览、账号工作台、请求统计、日志流、模型与能力、连通性检测、配置与安全信息。
 - 本地使用统计：只记录请求元数据，不保存聊天正文。
 - Dockerfile、docker-compose 和 GHCR 镜像构建工作流。
 
@@ -112,19 +113,34 @@ http://127.0.0.1:8000/ui
 管理控制台包含：
 
 - **总览**：查看服务就绪度、当前启用账号、请求数量、成功率、平均延迟和最近请求。
-- **账号工作台**：生成登录 URL，粘贴 OAuth 回调地址，新增账号或覆盖已有账号，启用、重命名、删除账号。
+- **账号工作台**：生成登录 URL，粘贴 OAuth 回调地址，新增账号或覆盖已有账号，启用、重命名、删除账号，编辑账号标签与备注。
 - **请求透视**：按日期、模型、账号查看本地请求元数据。
+- **日志流**：查看最近请求流水，支持自动刷新、定位到最新、按状态/流式/账号/模型筛选。
+- **模型与能力**：按账号刷新 DevEco 模型配置，复制模型 ID，并切换账号调度策略。
 - **连通性检测**：手动检测单个或全部账号是否能访问 DevEco 模型配置接口。
-- **配置与安全**：查看 Bearer 认证状态、凭据目录和持久化文件是否存在。
+- **配置与安全**：查看 Bearer 认证状态、凭据目录和持久化文件是否存在，并一键复制 OpenAI SDK/curl 接入配置。
 
 控制台不会展示真实 access token、refresh token、JWT、回调临时凭证或 Authorization 头。
 
+## 多账号调度策略
+
+默认策略是 `active_only`，保持旧版本行为：所有 `/v1/models` 和 `/v1/chat/completions` 请求都使用当前启用账号。
+
+可以通过环境变量或 `/ui` 的“模型与能力”页切换策略：
+
+| 策略 | 行为 |
+| --- | --- |
+| `active_only` | 只使用当前启用账号。 |
+| `round_robin` | 在可用账号之间按请求轮询。显式检测失败的账号会被降级；如果全部账号都失败，会退回到所有有凭据的账号中尝试。 |
+| `failover` | 优先当前启用账号；上游失败时尝试后续可用账号。 |
+
+使用统计会记录实际发起请求的 `account_id`。策略不会改变凭据保存方式，也不会把 token 写入日志或 UI。
+
 ## Docker 部署
 
-仓库包含 `Dockerfile`，基于 Python 3.12 和 uv 构建运行镜像。
+默认镜像发布在 GHCR：`ghcr.io/qizhuxu/hm-rev:latest`（每次推送到 `main` 时重新构建）。
 
 ```bash
-docker build -t hm-api:local .
 docker run --rm \
   -p 8000:8000 \
   -e HM_API_HOST=0.0.0.0 \
@@ -132,7 +148,14 @@ docker run --rm \
   -e HM_API_KEY=replace-with-local-key \
   -e HM_API_CRED_DIR=/data/cred \
   -v hm_api_cred:/data/cred \
-  hm-api:local
+  ghcr.io/qizhuxu/hm-rev:latest
+```
+
+如需本地构建（`Dockerfile` 基于 Python 3.12 和 uv）：
+
+```bash
+docker build -t hm-api:local .
+docker run --rm -p 8000:8000 -e HM_API_KEY=replace-with-local-key -v hm_api_cred:/data/cred hm-api:local
 ```
 
 容器启动后访问：
@@ -151,6 +174,8 @@ http://127.0.0.1:8000/ui
 docker compose up -d
 ```
 
+默认拉取 `ghcr.io/qizhuxu/hm-rev:latest`（`pull_policy: always`）。如需本地构建，取消 `docker-compose.yml` 中 `build: .` 的注释。
+
 `docker-compose.yml` 会把命名卷 `hm_api_cred` 挂载到 `/data/cred`，用于持久化账号凭据、使用统计和本地加密密钥。
 
 ## GitHub Actions 镜像构建
@@ -159,6 +184,7 @@ docker compose up -d
 
 - Pull Request：只构建，不推送。
 - `main` 分支和 `v*.*.*` 标签：构建并发布到 GHCR。
+- `main` 分支额外打 `latest` 标签，即 `ghcr.io/qizhuxu/hm-rev:latest`。
 - 使用 `docker/metadata-action` 与 `docker/build-push-action`。
 
 ## 环境变量
@@ -169,6 +195,7 @@ docker compose up -d
 | `HM_API_PORT` | `8000` | `hm-api serve` 默认监听端口。 |
 | `HM_API_KEY` | 空 | 可选 Bearer API Key。设置后 API 和 UI API 都需要认证。 |
 | `HM_API_PROXY` | 空 | 可选上游 HTTP/HTTPS 代理。 |
+| `HM_API_ACCOUNT_STRATEGY` | `active_only` | 多账号调度策略：`active_only`、`round_robin` 或 `failover`。 |
 | `HM_API_CRED_DIR` | `./cred` | 本地凭据、账号状态、使用统计和加密密钥目录。 |
 
 ## 数据持久化
@@ -181,7 +208,7 @@ docker compose up -d
 - `usage.jsonl`：本地请求元数据统计。
 - `.kek`：本地 AES-GCM 加密密钥。
 
-`usage.jsonl` 只记录请求元数据，例如时间、接口、账号 ID、模型名、是否流式、状态码、延迟、成功状态和上游返回的 token usage。它不保存聊天正文、原始凭据或 Authorization 头。
+`usage.jsonl` 只记录请求元数据，例如时间、接口、实际使用的账号 ID、模型名、是否流式、状态码、延迟、成功状态和上游返回的 token usage。它不保存聊天正文、原始凭据或 Authorization 头。
 
 这些文件必须持久化，但不能提交到 Git，也不能烘焙进 Docker 镜像层。
 

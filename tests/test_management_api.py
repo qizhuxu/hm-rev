@@ -3,6 +3,7 @@ from fastapi.testclient import TestClient
 from hm_api.accounts import save_account_from_user_info
 from hm_api.login import LoginResult, UserInfo
 from hm_api.server import build_app
+from hm_api.usage import record_usage_event
 
 
 def _user_info(
@@ -30,8 +31,14 @@ def test_chinese_console_ui_contains_operations(monkeypatch, tmp_path):
     assert "账号工作台" in response.text
     assert "登录向导" in response.text
     assert "请求透视" in response.text
+    assert "日志流" in response.text
+    assert "模型与能力" in response.text
     assert "服务就绪度" in response.text
     assert "连通性检测" in response.text
+    assert "账号标签" in response.text
+    assert "接入配置" in response.text
+    assert "autoRefreshLogs" in response.text
+    assert "copyPythonConfig" in response.text
     assert "配置与安全" in response.text
     assert "账号状态加载中" in response.text
     assert "accountTarget" in response.text
@@ -171,3 +178,99 @@ def test_management_api_requires_bearer_auth(monkeypatch, tmp_path):
 
     assert unauthorized.status_code == 401
     assert authorized.status_code == 200
+
+
+def test_account_strategy_api_reads_and_updates_strategy(monkeypatch, tmp_path):
+    monkeypatch.setenv("HM_API_CRED_DIR", str(tmp_path / "cred"))
+    client = TestClient(build_app())
+
+    initial = client.get("/ui/api/account-strategy")
+    updated = client.put(
+        "/ui/api/account-strategy",
+        json={"strategy": "round_robin"},
+    )
+
+    assert initial.status_code == 200
+    assert initial.json()["strategy"] == "active_only"
+    assert updated.status_code == 200
+    assert updated.json()["strategy"] == "round_robin"
+
+
+def test_account_profile_api_updates_tags_and_note(monkeypatch, tmp_path):
+    monkeypatch.setenv("HM_API_CRED_DIR", str(tmp_path / "cred"))
+    account_id = save_account_from_user_info(_user_info(), display_name="生产账号")
+    client = TestClient(build_app())
+
+    response = client.patch(
+        f"/ui/api/accounts/{account_id}",
+        json={
+            "display_name": "生产主号",
+            "tags": ["生产", "主力"],
+            "note": "工作日优先使用",
+        },
+    )
+
+    assert response.status_code == 200
+    account = response.json()["account"]
+    assert account["display_name"] == "生产主号"
+    assert account["tags"] == ["生产", "主力"]
+    assert account["note"] == "工作日优先使用"
+    assert "access-token" not in response.text
+
+
+def test_usage_events_api_returns_recent_log_stream(monkeypatch, tmp_path):
+    monkeypatch.setenv("HM_API_CRED_DIR", str(tmp_path / "cred"))
+    record_usage_event(
+        account_id="acc-1",
+        endpoint="/v1/models",
+        request_body={"messages": [{"role": "user", "content": "不要保存"}]},
+        status_code=200,
+        latency_ms=11,
+        success=True,
+    )
+    client = TestClient(build_app())
+
+    response = client.get("/ui/api/usage/events?limit=10")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["events"][0]["account_id"] == "acc-1"
+    assert body["events"][0]["endpoint"] == "/v1/models"
+    assert "不要保存" not in response.text
+
+
+def test_model_capabilities_api_refreshes_without_leaking_tokens(monkeypatch, tmp_path):
+    monkeypatch.setenv("HM_API_CRED_DIR", str(tmp_path / "cred"))
+    account_id = save_account_from_user_info(
+        _user_info(access="secret-access-token"),
+        display_name="生产账号",
+    )
+
+    async def fake_fetch(account_id_arg: str, proxy: str | None = None):
+        assert account_id_arg == account_id
+        return {
+            "account_id": account_id_arg,
+            "account_name": "生产账号",
+            "success": True,
+            "status_code": 200,
+            "latency_ms": 23,
+            "checked_at": "2026-06-30T12:00:00Z",
+            "model_count": 2,
+            "models": [
+                {"id": "model-a", "owned_by": "deveco"},
+                {"id": "model-b", "owned_by": "deveco"},
+            ],
+            "error": None,
+        }
+
+    monkeypatch.setattr("hm_api.server.fetch_account_models", fake_fetch)
+    client = TestClient(build_app())
+
+    response = client.post(
+        "/ui/api/models/refresh",
+        json={"account_id": account_id},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["results"][0]["models"][0]["id"] == "model-a"
+    assert "secret-access-token" not in response.text
