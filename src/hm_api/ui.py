@@ -662,10 +662,10 @@ def render_ui_html() -> str:
                 </div>
               </div>
               <ol class="steps">
-                <li>选择新增账号或覆盖已有账号，设置回调端口。</li>
+                <li>选择新增账号或覆盖已有账号，设置回调端口（容器部署用宿主映射端口）。</li>
                 <li>生成并复制登录 URL，在浏览器完成 DevEco 授权。</li>
-                <li>把浏览器跳转后的完整回调地址或 Query 粘贴回来。</li>
-                <li>保存后账号会写入本地凭据目录，并自动设为当前启用。</li>
+                <li>授权成功后浏览器会自动回调 hm-api，无需手动粘贴。</li>
+                <li>如果自动回调失败，可以手动粘贴回调地址。保存后账号会写入本地凭据目录，并自动设为当前启用。</li>
               </ol>
               <label for="accountTarget">保存方式</label>
               <select id="accountTarget">
@@ -675,6 +675,7 @@ def render_ui_html() -> str:
               <input id="displayName" placeholder="例如：生产账号">
               <label for="callbackPort">回调端口</label>
               <input id="callbackPort" type="number" min="1" max="65535" value="10101">
+              <p class="panel-sub" style="margin-top:-6px; font-size:0.85em">容器部署时填宿主侧映射端口，DevEco 会回调到 hm-api 自身。</p>
               <div class="toolbar">
                 <button id="createLogin">生成登录 URL</button>
                 <button id="copyLogin" class="secondary" disabled>复制 URL</button>
@@ -1755,6 +1756,27 @@ console.log(response.choices[0].message.content);`;
       await loadOverview();
     });
     loadOverview();
+    // Auto-fill callback port from current page's port
+    if (window.location.port) {
+      $("callbackPort").value = window.location.port;
+    }
+    // Check for login callback result (redirected from /callback)
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.has("login_success")) {
+      setMessage("accountMessage", "账号登录成功并已保存", true);
+      loadAccounts();
+      window.history.replaceState(null, "", window.location.pathname);
+    } else if (urlParams.has("login_error")) {
+      const errors = {
+        expired: "登录链接已过期，请重新生成",
+        cancelled: "用户取消了登录",
+        missing: "回调缺少必要参数",
+        region: "仅支持中国站点账号",
+        failed: "登录失败，请重试",
+      };
+      setMessage("accountMessage", errors[urlParams.get("login_error")] || "登录失败", false);
+      window.history.replaceState(null, "", window.location.pathname);
+    }
   </script>
 </body>
 </html>"""

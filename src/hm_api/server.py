@@ -12,7 +12,7 @@ from typing import AsyncGenerator
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .accounts import (
@@ -31,7 +31,18 @@ from .accounts import (
     update_account_profile,
 )
 from .config import DEVECO_BASE_URL, DEVECO_DEFAULT_AUTH_PORT, USER_AGENT, get_cred_dir
-from .login import complete_manual_login, create_login_challenge, is_logged_in, load_session
+from .login import (
+    _parse_callback_params,
+    complete_manual_login,
+    create_login_challenge,
+    exchange_temp_token,
+    get_challenge,
+    is_logged_in,
+    load_session,
+    register_challenge,
+    remove_challenge,
+    save_user_info,
+)
 from .ui import render_ui_html
 from .usage import get_usage_events, get_usage_summary, record_usage_event
 
@@ -177,7 +188,7 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
-        if api_key is None or request.url.path == "/ui":
+        if api_key is None or request.url.path in ("/ui", "/callback"):
             return await call_next(request)
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer ") or not secrets.compare_digest(
@@ -205,6 +216,7 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
     @app.post("/ui/api/login-url", response_model=None)
     async def ui_login_url(payload: LoginUrlRequest) -> JSONResponse:
         challenge = create_login_challenge(port=payload.callback_port)
+        register_challenge(challenge)
         return JSONResponse(
             {
                 "login_url": challenge.login_url,
@@ -212,6 +224,52 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
                 "callback_port": challenge.port,
             }
         )
+
+    @app.post("/callback")
+    async def handle_callback(request: Request) -> RedirectResponse:
+        """Receive DevEco OAuth POST callback and complete login.
+
+        DevEco redirects the user's browser to POST the callback (form-urlencoded)
+        to the URL we specified in the login URL. This endpoint captures it,
+        exchanges the tempToken for real credentials, saves the account, then
+        redirects the browser back to the management console.
+        """
+        body = await request.body()
+        parsed = _parse_callback_params("/callback", body)
+
+        code = parsed.code
+        temp_token = parsed.temp_token
+        site_id = parsed.site_id
+        quit_val = parsed.quit
+
+        # Look up the pending challenge
+        challenge = get_challenge(code) if code else None
+
+        if not challenge:
+            return RedirectResponse(url="/ui?login_error=expired", status_code=303)
+        # challenge is set → code is non-None
+        assert code is not None
+
+        if quit_val in ("true", "access_denied"):
+            remove_challenge(code)
+            return RedirectResponse(url="/ui?login_error=cancelled", status_code=303)
+
+        if not temp_token or not site_id:
+            remove_challenge(code)
+            return RedirectResponse(url="/ui?login_error=missing", status_code=303)
+
+        if site_id != "1":
+            remove_challenge(code)
+            return RedirectResponse(url="/ui?login_error=region", status_code=303)
+
+        try:
+            user_info = await exchange_temp_token(temp_token, proxy=proxy)
+            save_user_info(user_info)
+            remove_challenge(code)
+            return RedirectResponse(url="/ui?login_success=1", status_code=303)
+        except Exception:
+            remove_challenge(code)
+            return RedirectResponse(url="/ui?login_error=failed", status_code=303)
 
     @app.post("/ui/api/manual-callback", response_model=None)
     async def ui_manual_callback(payload: ManualCallbackRequest) -> JSONResponse:
@@ -302,6 +360,7 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
     @app.post("/ui/api/accounts/login-url", response_model=None)
     async def ui_account_login_url(payload: LoginUrlRequest) -> JSONResponse:
         challenge = create_login_challenge(port=payload.callback_port)
+        register_challenge(challenge)
         return JSONResponse(
             {
                 "login_url": challenge.login_url,

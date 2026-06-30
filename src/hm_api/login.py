@@ -6,9 +6,11 @@ import asyncio
 import base64
 import json
 import os
+import time
 import uuid
 import webbrowser
 from dataclasses import dataclass
+from threading import Lock
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
@@ -445,6 +447,44 @@ async def _start_callback_server(
 
     server = await asyncio.start_server(handler, "127.0.0.1", port)
     return server, future
+
+
+_pending_challenges: dict[str, dict] = {}
+_pending_challenges_lock = Lock()
+PENDING_CHALLENGE_TTL = 1800  # 30 minutes
+
+def register_challenge(challenge: LoginChallenge) -> None:
+    """Register a pending login challenge for the hosted /callback route."""
+    with _pending_challenges_lock:
+        _clean_pending()
+        _pending_challenges[challenge.code] = {
+            "challenge": challenge,
+            "created_at": time.time(),
+        }
+
+def get_challenge(code: str) -> LoginChallenge | None:
+    """Look up a pending challenge by code."""
+    with _pending_challenges_lock:
+        _clean_pending()
+        entry = _pending_challenges.get(code)
+        if entry:
+            return entry["challenge"]
+        return None
+
+def remove_challenge(code: str) -> None:
+    """Remove a pending challenge after successful/failed login."""
+    with _pending_challenges_lock:
+        _pending_challenges.pop(code, None)
+
+def _clean_pending() -> None:
+    """Evict challenges older than TTL."""
+    now = time.time()
+    expired = [
+        k for k, v in _pending_challenges.items()
+        if now - v["created_at"] > PENDING_CHALLENGE_TTL
+    ]
+    for k in expired:
+        del _pending_challenges[k]
 
 
 async def login(
