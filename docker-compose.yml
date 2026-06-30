@@ -1,7 +1,8 @@
 services:
   hm-api:
     # Default: pull the latest published image from GHCR.
-    # To build locally instead, uncomment the `build` line below.
+    # To build locally instead (e.g. to pick up Dockerfile changes), uncomment
+    # the `build` line below and run `docker compose build`.
     # build: .
     image: ghcr.io/qizhuxu/hm-rev:latest
     pull_policy: always
@@ -14,8 +15,14 @@ services:
       HM_API_PROXY: ${HM_API_PROXY:-}
       HM_API_ACCOUNT_STRATEGY: ${HM_API_ACCOUNT_STRATEGY:-active_only}
       HM_API_CRED_DIR: ${HM_API_CRED_DIR:-/data/cred}
+      # uid/gid the entrypoint drops to before running hm-api. Set to your host
+      # user's uid/gid when bind-mounting the cred dir (see HM_API_CRED_DIR_HOST).
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
     volumes:
-      - hm_api_cred:/data/cred
+      # Named volume by default. To keep credentials on the host, set
+      # HM_API_CRED_DIR_HOST=./cred in .env (the entrypoint chowns it to PUID).
+      - ${HM_API_CRED_DIR_HOST:-hm_api_cred}:/data/cred
     restart: unless-stopped
 
 volumes:
