@@ -92,6 +92,13 @@ def _overview_payload(api_key: str | None) -> dict[str, Any]:
         None,
     )
     cred_dir = get_cred_dir()
+    credential_files = {
+        "accounts_json": (cred_dir / "accounts.json").exists(),
+        "usage_jsonl": (cred_dir / "usage.jsonl").exists(),
+        "auth_json": (cred_dir / "auth.json").exists(),
+        "token_enc": (cred_dir / "token.enc").exists(),
+        "kek": (cred_dir / ".kek").exists(),
+    }
     return {
         "logged_in": active_account is not None,
         "auth_enabled": api_key is not None,
@@ -99,6 +106,7 @@ def _overview_payload(api_key: str | None) -> dict[str, Any]:
             "path": str(cred_dir),
             "exists": cred_dir.exists(),
         },
+        "credential_files": credential_files,
         "active_account": active_account,
         "active_account_id": state["active_account_id"],
         "accounts": accounts,

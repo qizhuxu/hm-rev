@@ -73,6 +73,30 @@ def test_legacy_single_account_is_migrated(monkeypatch, tmp_path):
     assert get_accounts_file().exists()
 
 
+def test_legacy_single_account_without_refresh_is_migrated(monkeypatch, tmp_path):
+    monkeypatch.setenv("HM_API_CRED_DIR", str(tmp_path / "cred"))
+    save_auth_data(
+        {
+            "deveco": {
+                "type": "oauth",
+                "access": "legacy-access-token",
+            }
+        }
+    )
+    token_file = get_token_file()
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    token_file.write_text(json.dumps(encrypt_value(_fake_jwt())), encoding="utf-8")
+
+    accounts = list_accounts()
+    active = get_active_account()
+
+    assert len(accounts) == 1
+    assert accounts[0]["is_active"] is True
+    assert active is not None
+    assert active["access_token"] == "legacy-access-token"
+    assert active["refresh_token"] == ""
+
+
 def test_save_activate_rename_and_delete_accounts(monkeypatch, tmp_path):
     monkeypatch.setenv("HM_API_CRED_DIR", str(tmp_path / "cred"))
 

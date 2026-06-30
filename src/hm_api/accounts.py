@@ -126,9 +126,9 @@ def _migrate_legacy_state() -> dict[str, Any]:
     data = load_auth_data()
     deveco = data.get("deveco", {}) if isinstance(data, dict) else {}
     access = deveco.get("access")
-    refresh = deveco.get("refresh")
+    refresh = deveco.get("refresh") or ""
     jwt_token = _read_token_file()
-    if not access or not refresh or not jwt_token:
+    if not access or not jwt_token:
         return _default_state()
 
     payload = _parse_jwt_payload(jwt_token)

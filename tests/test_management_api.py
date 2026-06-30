@@ -27,9 +27,16 @@ def test_chinese_console_ui_contains_operations(monkeypatch, tmp_path):
 
     assert response.status_code == 200
     assert "总览" in response.text
-    assert "账号管理" in response.text
-    assert "使用统计" in response.text
+    assert "账号工作台" in response.text
+    assert "登录向导" in response.text
+    assert "请求透视" in response.text
+    assert "服务就绪度" in response.text
     assert "连通性检测" in response.text
+    assert "配置与安全" in response.text
+    assert "账号状态加载中" in response.text
+    assert "accountTarget" in response.text
+    assert "覆盖：" in response.text
+    assert "credentialFiles" in response.text
     assert "access_token" not in response.text
     assert "refresh_token" not in response.text
 
@@ -101,6 +108,30 @@ def test_active_account_token_is_used_for_openai_api(monkeypatch, tmp_path):
 
     assert response.status_code == 200
     assert response.json()["active_account"]["user_name"] == "账号一"
+
+
+def test_overview_reports_credential_file_presence_only(monkeypatch, tmp_path):
+    cred_dir = tmp_path / "cred"
+    monkeypatch.setenv("HM_API_CRED_DIR", str(cred_dir))
+    cred_dir.mkdir(parents=True)
+    (cred_dir / "accounts.json").write_text(
+        '{"version": 1, "active_account_id": null, "accounts": []}',
+        encoding="utf-8",
+    )
+    (cred_dir / "usage.jsonl").write_text("", encoding="utf-8")
+    client = TestClient(build_app())
+
+    response = client.get("/ui/api/overview")
+
+    assert response.status_code == 200
+    files = response.json()["credential_files"]
+    assert files == {
+        "accounts_json": True,
+        "usage_jsonl": True,
+        "auth_json": False,
+        "token_enc": False,
+        "kek": False,
+    }
 
 
 def test_connectivity_check_success_and_failure_are_sanitized(monkeypatch, tmp_path):
