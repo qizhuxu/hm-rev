@@ -6,6 +6,8 @@
 
 - `/v1/models`：OpenAI 兼容模型列表接口。
 - `/v1/chat/completions`：OpenAI 兼容聊天补全接口。
+- `/v1/messages`：Anthropic Messages 兼容接口（流式 + 非流式，支持工具调用）。
+- `/v1/responses`：OpenAI Responses 兼容接口（流式 + 非流式，支持工具调用）。
 - `/ui`：中文管理控制台，用于登录、账号管理、使用统计和连通性检测。
 
 ## 功能特性
@@ -14,7 +16,8 @@
 - 多账号管理：新增、覆盖、启用、重命名、删除账号，并支持标签与备注。
 - 多账号调度：支持仅当前账号、轮询账号、失败自动切换三种策略。
 - 本地 AES-GCM 加密保存凭据。
-- OpenAI 兼容 `/v1/models` 与 `/v1/chat/completions`。
+- OpenAI 兼容 `/v1/models`、`/v1/chat/completions`，以及 Anthropic `/v1/messages` 与 OpenAI `/v1/responses` 三种聊天协议格式。
+- 工具调用（function/tool calling）在三种格式间正确互转：Anthropic `tool_use` ↔ OpenAI `tool_calls` ↔ Responses `function_call`。
 - 中文管理 UI：总览、账号工作台、请求统计、日志流、模型与能力、连通性检测、配置与安全信息。
 - 本地使用统计：只记录请求元数据，不保存聊天正文。
 - Dockerfile、docker-compose 和 GHCR 镜像构建工作流。
@@ -102,6 +105,44 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 示例中的 Key 和模型名都是占位内容。不要把真实 API Key、DevEco 凭据、JWT、临时回调参数或其他敏感信息写入文档、日志或 Git。
 
+### Anthropic Messages 格式（`/v1/messages`）
+
+Anthropic 客户端使用 `x-api-key` 头鉴权（也接受 `Authorization: Bearer`）：
+
+```bash
+curl http://127.0.0.1:8000/v1/messages \
+  -H "x-api-key: replace-with-local-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "GLM-5.1",
+    "max_tokens": 1024,
+    "messages": [
+      {"role": "user", "content": "你好，请用一句话介绍 hm-api。"}
+    ]
+  }'
+```
+
+### OpenAI Responses 格式（`/v1/responses`）
+
+```bash
+curl http://127.0.0.1:8000/v1/responses \
+  -H "Authorization: Bearer replace-with-local-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "GLM-5.1",
+    "input": "你好，请用一句话介绍 hm-api。"
+  }'
+```
+
+### 工具调用
+
+三种格式都支持工具调用，并在格式间互转（Anthropic `tool_use` ↔ OpenAI `tool_calls` ↔ Responses `function_call`）。例如向 `/v1/messages` 传 `tools`（含 `input_schema`），代理会转成 OpenAI `tools`（含 `parameters`）发给上游，再把上游返回的 `tool_calls` 转回 Anthropic `tool_use` content block。
+
+> 上游能力说明：`/v1/messages`、`/v1/responses` 与工具调用基于“DevEco `v2/chat/completions` 遵循 OpenAI 工具字段”的假设实现。是否真正执行 `tools`/`tool_choice`、流式 `tool_calls` 增量字段名、`usage` 字段名，需用真实账号验证一次；若上游行为不同，请同步调整 `src/hm_api/adapters/` 并更新本说明。
+
+`/v1/responses` 为无状态实现：`previous_response_id` / `store` 等参数被接受但忽略；内置工具（web_search / code_interpreter / file_search）不转发。
+
 ## 中文管理控制台 `/ui`
 
 启动服务后访问：
@@ -124,7 +165,7 @@ http://127.0.0.1:8000/ui
 
 ## 多账号调度策略
 
-默认策略是 `active_only`，保持旧版本行为：所有 `/v1/models` 和 `/v1/chat/completions` 请求都使用当前启用账号。
+默认策略是 `active_only`，保持旧版本行为：所有 `/v1/models`、`/v1/chat/completions`、`/v1/messages`、`/v1/responses` 请求都使用当前启用账号。
 
 可以通过环境变量或 `/ui` 的“模型与能力”页切换策略：
 
@@ -235,7 +276,8 @@ uv run pytest
 ```text
 src/hm_api/
   cli.py       Typer CLI 命令：login、serve、status
-  server.py    FastAPI 应用、OpenAI 兼容代理、UI 路由
+  server.py    FastAPI 应用、OpenAI/Anthropic 兼容代理、UI 路由
+  adapters/    API 格式翻译：anthropic.py、responses.py、common.py（SSE 解析）
   login.py     DevEco OAuth、回调解析、会话加载
   accounts.py  多账号存储、迁移、连通性检测
   usage.py     本地请求元数据统计

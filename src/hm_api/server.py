@@ -30,6 +30,20 @@ from .accounts import (
     set_account_strategy,
     update_account_profile,
 )
+from .adapters import (
+    SSE_DONE,
+    StreamEvent,
+    anthropic_error,
+    anthropic_request_to_openai,
+    openai_response_to_anthropic,
+    openai_response_to_responses,
+    openai_stream_to_anthropic,
+    openai_stream_to_responses,
+    parse_openai_sse,
+    responses_error,
+    responses_request_to_openai,
+    sse_chunk,
+)
 from .config import DEVECO_BASE_URL, DEVECO_DEFAULT_AUTH_PORT, USER_AGENT, get_cred_dir
 from .login import (
     _parse_callback_params,
@@ -191,9 +205,11 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
         if api_key is None or request.url.path in ("/ui", "/callback"):
             return await call_next(request)
         auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer ") or not secrets.compare_digest(
-            auth[7:], api_key
-        ):
+        xkey = request.headers.get("x-api-key", "")
+        ok = (auth.startswith("Bearer ") and secrets.compare_digest(auth[7:], api_key)) or (
+            bool(xkey) and secrets.compare_digest(xkey, api_key)
+        )
+        if not ok:
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
         return await call_next(request)
 
@@ -550,6 +566,179 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
         assert last_error is not None
         raise last_error
 
+    def _build_upstream_headers(request: Request) -> dict[str, str]:
+        session_id = request.headers.get("x-deveco-session") or request.headers.get(
+            "x-session-affinity"
+        )
+        chat_id = uuid.uuid4().hex.replace("-", "")
+        base_headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "lang": "en",
+            "Chat-Id": chat_id,
+        }
+        if session_id:
+            base_headers["Session-Id"] = session_id
+        for key, value in request.headers.items():
+            lower = key.lower()
+            if lower in {
+                "host",
+                "authorization",
+                "content-length",
+                "content-type",
+                "connection",
+                "accept-encoding",
+                "x-api-key",
+                "anthropic-version",
+            }:
+                continue
+            base_headers[key] = value
+        return base_headers
+
+    def _headers_for(
+        account: dict[str, Any], base_headers: dict[str, str]
+    ) -> dict[str, str]:
+        return {**base_headers, "Authorization": f"Bearer {account['access_token']}"}
+
+    async def _forward_chat_nonstream(
+        *,
+        openai_body_bytes: bytes,
+        usage_body: dict[str, Any],
+        request: Request,
+        started: float,
+        endpoint: str,
+        strategy: str,
+        accounts: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Forward an OpenAI Chat Completions body upstream (non-stream).
+
+        Returns ``{"kind": "ok", "content": <upstream dict>}`` on success or
+        ``{"kind": "error", "status": <code>, "message": <redacted>}`` on
+        failure (after exhausting failover). Caller formats the response.
+        """
+        base_headers = _build_upstream_headers(request)
+        url = f"{TARGET_BASE}/v2/no-stream/chat/completions"
+        last_error: tuple[int, str] | None = None
+        for index, account in enumerate(accounts):
+            mark_account_used(str(account["account_id"]))
+            upstream_resp = await client.post(
+                url,
+                headers=_headers_for(account, base_headers),
+                content=openai_body_bytes,
+            )
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            if upstream_resp.status_code != 200:
+                record_usage_event(
+                    account_id=str(account["account_id"]),
+                    endpoint=endpoint,
+                    request_body=usage_body,
+                    status_code=upstream_resp.status_code,
+                    latency_ms=latency_ms,
+                    success=False,
+                )
+                last_error = (
+                    upstream_resp.status_code,
+                    _redact_sensitive(upstream_resp.text or "Upstream error", account),
+                )
+                if _can_try_next(strategy, index, accounts):
+                    continue
+                return {
+                    "kind": "error",
+                    "status": last_error[0],
+                    "message": last_error[1],
+                }
+            response_content: Any
+            if upstream_resp.headers.get("content-type", "").startswith(
+                "application/json"
+            ):
+                try:
+                    response_content = upstream_resp.json()
+                except ValueError:
+                    record_usage_event(
+                        account_id=str(account["account_id"]),
+                        endpoint=endpoint,
+                        request_body=usage_body,
+                        status_code=502,
+                        latency_ms=latency_ms,
+                        success=False,
+                    )
+                    last_error = (502, "Invalid upstream response")
+                    if _can_try_next(strategy, index, accounts):
+                        continue
+                    return {"kind": "error", "status": 502, "message": last_error[1]}
+            else:
+                response_content = {"data": upstream_resp.text}
+            record_usage_event(
+                account_id=str(account["account_id"]),
+                endpoint=endpoint,
+                request_body=usage_body,
+                status_code=upstream_resp.status_code,
+                latency_ms=latency_ms,
+                success=True,
+                usage=_usage_payload(response_content),
+            )
+            return {"kind": "ok", "content": response_content}
+        assert last_error is not None
+        return {"kind": "error", "status": last_error[0], "message": last_error[1]}
+
+    async def _forward_chat_stream(
+        *,
+        openai_body_bytes: bytes,
+        usage_body: dict[str, Any],
+        request: Request,
+        started: float,
+        endpoint: str,
+        strategy: str,
+        accounts: list[dict[str, Any]],
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """Forward an OpenAI Chat Completions body upstream (stream).
+
+        Yields parsed ``StreamEvent``s (chunk / done / error). On a non-200
+        upstream, tries the next candidate under failover before yielding a
+        single ``error`` event. Usage is recorded in a ``finally`` per attempt.
+        """
+        base_headers = _build_upstream_headers(request)
+        url = f"{TARGET_BASE}/v2/chat/completions"
+        last_error = "Upstream error"
+        for index, account in enumerate(accounts):
+            mark_account_used(str(account["account_id"]))
+            status_code = 502
+            success = False
+            try:
+                async with client.stream(
+                    "POST",
+                    url,
+                    headers=_headers_for(account, base_headers),
+                    content=openai_body_bytes,
+                ) as upstream_resp:
+                    status_code = upstream_resp.status_code
+                    if upstream_resp.status_code != 200:
+                        text = await upstream_resp.aread()
+                        last_error = _redact_sensitive(
+                            text.decode("utf-8", errors="replace")
+                            or "Upstream error",
+                            account,
+                        )
+                    else:
+                        success = True
+                        async for event in parse_openai_sse(
+                            upstream_resp.aiter_bytes()
+                        ):
+                            yield event
+                        return
+            finally:
+                record_usage_event(
+                    account_id=str(account["account_id"]),
+                    endpoint=endpoint,
+                    request_body=usage_body,
+                    status_code=status_code,
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    success=success,
+                )
+            if _can_try_next(strategy, index, accounts):
+                continue
+            yield StreamEvent(kind="error", data=last_error)
+            return
+
     @app.post("/v1/chat/completions", response_model=None)
     async def chat_completions(request: Request) -> StreamingResponse | JSONResponse:
         started = time.perf_counter()
@@ -582,81 +771,24 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="Invalid JSON body")
 
         stream = bool(body_json.get("stream"))
-        target_path = "v2/chat/completions"
-        if not stream:
-            target_path = "v2/no-stream/chat/completions"
-        url = f"{TARGET_BASE}/{target_path}"
-
-        session_id = request.headers.get("x-deveco-session") or request.headers.get("x-session-affinity")
-        chat_id = uuid.uuid4().hex.replace("-", "")
-
-        base_headers = {
-            "Content-Type": "application/json",
-            "lang": "en",
-            "Chat-Id": chat_id,
-        }
-        if session_id:
-            base_headers["Session-Id"] = session_id
-
-        for key, value in request.headers.items():
-            lower = key.lower()
-            if lower in {
-                "host",
-                "authorization",
-                "content-length",
-                "content-type",
-                "connection",
-                "accept-encoding",
-            }:
-                continue
-            base_headers[key] = value
-
-        def headers_for(account: dict[str, Any]) -> dict[str, str]:
-            return {
-                **base_headers,
-                "Authorization": f"Bearer {account['access_token']}",
-            }
 
         if stream:
             async def streamer() -> AsyncGenerator[bytes, None]:
-                last_error = "Upstream error"
-                for index, account in enumerate(accounts):
-                    mark_account_used(str(account["account_id"]))
-                    status_code = 502
-                    success = False
-                    try:
-                        async with client.stream(
-                            "POST",
-                            url,
-                            headers=headers_for(account),
-                            content=body_bytes,
-                        ) as upstream_resp:
-                            status_code = upstream_resp.status_code
-                            if upstream_resp.status_code != 200:
-                                text = await upstream_resp.aread()
-                                last_error = _redact_sensitive(
-                                    text.decode("utf-8", errors="replace")
-                                    or "Upstream error",
-                                    account,
-                                )
-                            else:
-                                success = True
-                                async for chunk in upstream_resp.aiter_bytes():
-                                    yield chunk
-                                return
-                    finally:
-                        record_usage_event(
-                            account_id=str(account["account_id"]),
-                            endpoint="/v1/chat/completions",
-                            request_body=body_json,
-                            status_code=status_code,
-                            latency_ms=int((time.perf_counter() - started) * 1000),
-                            success=success,
-                        )
-                    if _can_try_next(strategy, index, accounts):
-                        continue
-                    yield json.dumps({"error": last_error}).encode()
-                    return
+                async for event in _forward_chat_stream(
+                    openai_body_bytes=body_bytes,
+                    usage_body=body_json,
+                    request=request,
+                    started=started,
+                    endpoint="/v1/chat/completions",
+                    strategy=strategy,
+                    accounts=accounts,
+                ):
+                    if event.kind == "chunk":
+                        yield sse_chunk(event.data)
+                    elif event.kind == "done":
+                        yield SSE_DONE
+                    else:
+                        yield sse_chunk({"error": event.data})
 
             return StreamingResponse(
                 streamer(),
@@ -665,75 +797,181 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
                 headers={"Cache-Control": "no-cache"},
             )
 
-        last_error_response: JSONResponse | None = None
-        for index, account in enumerate(accounts):
-            mark_account_used(str(account["account_id"]))
-            upstream_resp = await client.post(
-                url,
-                headers=headers_for(account),
-                content=body_bytes,
+        result = await _forward_chat_nonstream(
+            openai_body_bytes=body_bytes,
+            usage_body=body_json,
+            request=request,
+            started=started,
+            endpoint="/v1/chat/completions",
+            strategy=strategy,
+            accounts=accounts,
+        )
+        if result["kind"] == "error":
+            return JSONResponse(
+                content={"error": result["message"]},
+                status_code=result["status"],
             )
-            latency_ms = int((time.perf_counter() - started) * 1000)
+        return JSONResponse(content=result["content"], status_code=200)
 
-            if upstream_resp.status_code != 200:
-                record_usage_event(
-                    account_id=str(account["account_id"]),
-                    endpoint="/v1/chat/completions",
-                    request_body=body_json,
-                    status_code=upstream_resp.status_code,
-                    latency_ms=latency_ms,
-                    success=False,
-                )
-                last_error_response = JSONResponse(
-                    content={
-                        "error": _redact_sensitive(
-                            upstream_resp.text or "Upstream error",
-                            account,
-                        )
-                    },
-                    status_code=upstream_resp.status_code,
-                )
-                if _can_try_next(strategy, index, accounts):
-                    continue
-                return last_error_response
-
-            response_content: dict[str, Any]
-            if upstream_resp.headers.get("content-type", "").startswith("application/json"):
-                try:
-                    response_content = upstream_resp.json()
-                except ValueError:
-                    record_usage_event(
-                        account_id=str(account["account_id"]),
-                        endpoint="/v1/chat/completions",
-                        request_body=body_json,
-                        status_code=502,
-                        latency_ms=latency_ms,
-                        success=False,
-                    )
-                    last_error_response = JSONResponse(
-                        content={"error": "Invalid upstream response"},
-                        status_code=502,
-                    )
-                    if _can_try_next(strategy, index, accounts):
-                        continue
-                    return last_error_response
-            else:
-                response_content = {"data": upstream_resp.text}
+    @app.post("/v1/messages", response_model=None)
+    async def anthropic_messages(request: Request) -> StreamingResponse | JSONResponse:
+        started = time.perf_counter()
+        strategy, accounts = _account_candidates()
+        if not accounts:
             record_usage_event(
-                account_id=str(account["account_id"]),
-                endpoint="/v1/chat/completions",
-                request_body=body_json,
-                status_code=upstream_resp.status_code,
-                latency_ms=latency_ms,
-                success=True,
-                usage=_usage_payload(response_content),
+                account_id=None,
+                endpoint="/v1/messages",
+                request_body={},
+                status_code=401,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                success=False,
             )
             return JSONResponse(
-                content=response_content,
-                status_code=upstream_resp.status_code,
+                content=anthropic_error(401, "Not logged in"),
+                status_code=401,
             )
-        assert last_error_response is not None
-        return last_error_response
+
+        body_bytes = await request.body()
+        try:
+            body_json = json.loads(body_bytes or b"{}")
+        except json.JSONDecodeError:
+            record_usage_event(
+                account_id=str(accounts[0]["account_id"]),
+                endpoint="/v1/messages",
+                request_body={},
+                status_code=400,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                success=False,
+            )
+            return JSONResponse(
+                content=anthropic_error(400, "Invalid JSON body"),
+                status_code=400,
+            )
+
+        model = str(body_json.get("model") or "")
+        openai_body = anthropic_request_to_openai(body_json)
+        openai_bytes = json.dumps(openai_body, ensure_ascii=False).encode("utf-8")
+        stream = bool(openai_body.get("stream"))
+
+        if stream:
+            async def streamer() -> AsyncGenerator[bytes, None]:
+                events = _forward_chat_stream(
+                    openai_body_bytes=openai_bytes,
+                    usage_body=body_json,
+                    request=request,
+                    started=started,
+                    endpoint="/v1/messages",
+                    strategy=strategy,
+                    accounts=accounts,
+                )
+                async for chunk in openai_stream_to_anthropic(events, model):
+                    yield chunk
+
+            return StreamingResponse(
+                streamer(),
+                status_code=200,
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache"},
+            )
+
+        result = await _forward_chat_nonstream(
+            openai_body_bytes=openai_bytes,
+            usage_body=body_json,
+            request=request,
+            started=started,
+            endpoint="/v1/messages",
+            strategy=strategy,
+            accounts=accounts,
+        )
+        if result["kind"] == "error":
+            return JSONResponse(
+                content=anthropic_error(result["status"], result["message"]),
+                status_code=result["status"],
+            )
+        return JSONResponse(
+            content=openai_response_to_anthropic(result["content"], model),
+            status_code=200,
+        )
+
+    @app.post("/v1/responses", response_model=None)
+    async def openai_responses(request: Request) -> StreamingResponse | JSONResponse:
+        started = time.perf_counter()
+        strategy, accounts = _account_candidates()
+        if not accounts:
+            record_usage_event(
+                account_id=None,
+                endpoint="/v1/responses",
+                request_body={},
+                status_code=401,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                success=False,
+            )
+            return JSONResponse(
+                content=responses_error(401, "Not logged in"),
+                status_code=401,
+            )
+
+        body_bytes = await request.body()
+        try:
+            body_json = json.loads(body_bytes or b"{}")
+        except json.JSONDecodeError:
+            record_usage_event(
+                account_id=str(accounts[0]["account_id"]),
+                endpoint="/v1/responses",
+                request_body={},
+                status_code=400,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                success=False,
+            )
+            return JSONResponse(
+                content=responses_error(400, "Invalid JSON body"),
+                status_code=400,
+            )
+
+        model = str(body_json.get("model") or "")
+        openai_body = responses_request_to_openai(body_json)
+        openai_bytes = json.dumps(openai_body, ensure_ascii=False).encode("utf-8")
+        stream = bool(openai_body.get("stream"))
+
+        if stream:
+            async def streamer() -> AsyncGenerator[bytes, None]:
+                events = _forward_chat_stream(
+                    openai_body_bytes=openai_bytes,
+                    usage_body=body_json,
+                    request=request,
+                    started=started,
+                    endpoint="/v1/responses",
+                    strategy=strategy,
+                    accounts=accounts,
+                )
+                async for chunk in openai_stream_to_responses(events, model):
+                    yield chunk
+
+            return StreamingResponse(
+                streamer(),
+                status_code=200,
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache"},
+            )
+
+        result = await _forward_chat_nonstream(
+            openai_body_bytes=openai_bytes,
+            usage_body=body_json,
+            request=request,
+            started=started,
+            endpoint="/v1/responses",
+            strategy=strategy,
+            accounts=accounts,
+        )
+        if result["kind"] == "error":
+            return JSONResponse(
+                content=responses_error(result["status"], result["message"]),
+                status_code=result["status"],
+            )
+        return JSONResponse(
+            content=openai_response_to_responses(result["content"], model),
+            status_code=200,
+        )
 
     return app
 
