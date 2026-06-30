@@ -151,20 +151,6 @@ docker run --rm \
   ghcr.io/qizhuxu/hm-rev:latest
 ```
 
-容器默认以 root 启动 entrypoint，把 `/data/cred` chown 成 `PUID`/`PGID`（默认 1000:1000）再用 gosu 降权运行 hm-api，这样应用写的 `0600` 凭据文件能被容器读取。命名卷场景默认即可工作。
-
-要把凭据直接落在宿主目录（便于备份/查看），改用 bind mount 并把 `PUID`/`PGID` 设成你宿主用户的 uid/gid（宿主跑 `id` 查看）：
-
-```bash
-docker run --rm \
-  -p 8000:8000 \
-  -e HM_API_KEY=replace-with-local-key \
-  -e PUID=$(id -u) \
-  -e PGID=$(id -g) \
-  -v "$(pwd)/cred:/data/cred" \
-  ghcr.io/qizhuxu/hm-rev:latest
-```
-
 如需本地构建（`Dockerfile` 基于 Python 3.12 和 uv）：
 
 ```bash
@@ -211,8 +197,6 @@ docker compose up -d
 | `HM_API_PROXY` | 空 | 可选上游 HTTP/HTTPS 代理。 |
 | `HM_API_ACCOUNT_STRATEGY` | `active_only` | 多账号调度策略：`active_only`、`round_robin` 或 `failover`。 |
 | `HM_API_CRED_DIR` | `./cred` | 本地凭据、账号状态、使用统计和加密密钥目录。 |
-| `PUID` / `PGID` | `1000` / `1000` | 仅 Docker：容器降权后的 uid/gid，entrypoint 会把凭据目录 chown 成它。bind mount 时设成宿主用户 uid/gid。 |
-| `HM_API_CRED_DIR_HOST` | 空 | 仅 Docker：留空用命名卷；设成宿主路径（如 `./cred`）则改为 bind mount。 |
 
 ## 数据持久化
 

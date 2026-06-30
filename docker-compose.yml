@@ -15,14 +15,8 @@ services:
       HM_API_PROXY: ${HM_API_PROXY:-}
       HM_API_ACCOUNT_STRATEGY: ${HM_API_ACCOUNT_STRATEGY:-active_only}
       HM_API_CRED_DIR: ${HM_API_CRED_DIR:-/data/cred}
-      # uid/gid the entrypoint drops to before running hm-api. Set to your host
-      # user's uid/gid when bind-mounting the cred dir (see HM_API_CRED_DIR_HOST).
-      PUID: ${PUID:-1000}
-      PGID: ${PGID:-1000}
     volumes:
-      # Named volume by default. To keep credentials on the host, set
-      # HM_API_CRED_DIR_HOST=./cred in .env (the entrypoint chowns it to PUID).
-      - ${HM_API_CRED_DIR_HOST:-hm_api_cred}:/data/cred
+      - hm_api_cred:/data/cred
     restart: unless-stopped
 
 volumes:
