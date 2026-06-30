@@ -6,7 +6,7 @@
 - Package code lives in `src/hm_api/`. The root `main.py` is only a placeholder entry point.
 - Use `uv` for dependency management and command execution. Runtime and dev dependencies are declared in `pyproject.toml`.
 - The app has real network side effects during OAuth login and proxy serving. Do not run login flows, open browsers, or call DevEco endpoints unless the user explicitly asks.
-- The FastAPI service also serves a lightweight management UI at `/ui` for login status, login URL generation, and manual OAuth callback completion.
+- The FastAPI service serves a Chinese management console at `/ui` for login, multi-account management, usage statistics, connectivity checks, and runtime configuration.
 
 ## Source Map
 
@@ -15,6 +15,9 @@
 | `src/hm_api/cli.py` | Typer CLI commands: `login`, `serve`, and `status`. |
 | `src/hm_api/login.py` | DevEco OAuth flow, localhost callback server, JWT parsing, and session loading. |
 | `src/hm_api/server.py` | FastAPI app with `/v1/models` and `/v1/chat/completions`, including streaming passthrough. |
+| `src/hm_api/accounts.py` | Multi-account credential state, legacy migration, active-account selection, and connectivity checks. |
+| `src/hm_api/usage.py` | Local JSONL request metadata statistics without storing prompt/message content. |
+| `src/hm_api/ui.py` | Chinese `/ui` management console HTML/CSS/JS. |
 | `src/hm_api/crypto.py` | AES-GCM helpers for encrypted local credential storage. |
 | `src/hm_api/config.py` | DevEco URLs, default ports, credential paths, and User-Agent constants. |
 | `Dockerfile` | uv-based Python 3.12 container image. |
@@ -28,7 +31,7 @@ uv sync
 uv run hm-api status
 uv run hm-api login --no-browser
 uv run hm-api serve --host 127.0.0.1 --port 8000 --key <secret>
-uv run ruff check src/
+uv run ruff check src/ tests/
 uv run pyright src/
 uv run pytest
 ```
@@ -38,13 +41,14 @@ uv run pytest
 - Do not use a real API key, access token, refresh token, JWT, or DevEco credential in examples.
 - `hm-api serve` can start while logged out so `/ui` can complete login, especially in containers.
 - Runtime environment variables: `HM_API_HOST`, `HM_API_PORT`, `HM_API_KEY`, `HM_API_PROXY`, and `HM_API_CRED_DIR`.
+- `/ui` should remain a real management console, not a marketing page. Follow `huashu-design` constraints for operational UI: Chinese copy, useful density, clear states/actions, no decorative hero, no fake stats, no token exposure.
 
 ## Tests And Verification
 
-- There is no committed test suite yet. When changing code, add focused tests under `tests/` and introduce `pytest` as a dev dependency if needed.
-- Good first test targets: `_parse_request`, `_parse_callback`, `_parse_jwt`, auth middleware behavior in `build_app`, model-list response shaping, and credential encrypt/decrypt round trips using a temporary credential directory.
+- When changing code, add focused tests under `tests/`.
+- Good first test targets: `_parse_request`, `_parse_callback`, `_parse_jwt`, auth middleware behavior in `build_app`, model-list response shaping, credential encrypt/decrypt round trips, multi-account migration, management API token redaction, usage statistics, and connectivity checks using a temporary credential directory.
 - Mock `httpx`/DevEco network calls in tests. Avoid tests that require a Huawei account, browser, or live OAuth callback.
-- For code changes, run at least `uv run ruff check src/` and `uv run pyright src/`. Run any added tests as well.
+- For code changes, run at least `uv run ruff check src/ tests/` and `uv run pyright src/`. Run any added tests as well.
 - This local workspace may not have Docker available. Do not claim Docker builds were verified locally unless a real `docker build` or `docker compose` command was run successfully.
 
 ## Security And Data Handling
@@ -54,7 +58,9 @@ uv run pytest
 - Keep bearer-token auth behavior in `server.py` conservative. When `--key` or `HM_API_KEY` is set, sensitive API routes must require `Authorization: Bearer <key>`. The static `/ui` page may remain public so browsers can load it, but UI API calls must stay protected.
 - Validate and fail clearly at boundaries: CLI options, JSON request bodies, callback parameters, proxy URLs, and upstream responses.
 - Preserve local-only callback binding (`127.0.0.1`) for OAuth unless there is an explicit, reviewed reason to change it.
-- Persist Docker credentials via a volume mounted at the configured `HM_API_CRED_DIR`; never bake `cred/` into an image layer.
+- Multi-account data lives in `accounts.json` under `HM_API_CRED_DIR`; token fields inside each account must stay AES-GCM encrypted and public account responses must strip `access_token`, `refresh_token`, `jwt_token`, `tempToken`, and Authorization data.
+- Usage statistics live in `usage.jsonl` under `HM_API_CRED_DIR`; only store metadata such as timestamp, endpoint, account ID, model, stream flag, status code, latency, success/error state, and upstream usage fields. Never store prompt text, message content, raw request bodies, or raw credentials.
+- Persist Docker credentials and local data via a volume mounted at the configured `HM_API_CRED_DIR`; never bake `cred/`, `accounts.json`, `usage.jsonl`, or `.kek` into an image layer.
 
 ## Coding Conventions
 
@@ -67,7 +73,7 @@ uv run pytest
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **hm-rev** (171 symbols, 296 relationships, 15 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **hm-rev** (249 symbols, 519 relationships, 18 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 

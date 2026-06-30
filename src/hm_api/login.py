@@ -25,6 +25,7 @@ from .config import (
     USER_AGENT,
     get_token_file,
 )
+from .accounts import get_active_account, save_account_from_user_info
 from .crypto import decrypt_value, encrypt_value, load_auth_data, save_auth_data
 
 
@@ -59,6 +60,7 @@ class UserInfo:
 class LoginResult:
     success: bool
     user_info: UserInfo | None = None
+    account_id: str | None = None
     cancelled: bool = False
     unsupported_region: bool = False
     error: str | None = None
@@ -338,9 +340,18 @@ def _save_access_token(access_token: str, refresh_token: str) -> None:
     save_auth_data(data)
 
 
-def save_user_info(user_info: UserInfo) -> None:
-    _save_token(user_info.jwt_token)
-    _save_access_token(user_info.access_token, user_info.refresh_token)
+def save_user_info(
+    user_info: UserInfo,
+    *,
+    display_name: str | None = None,
+    account_id: str | None = None,
+) -> str:
+    return save_account_from_user_info(
+        user_info,
+        display_name=display_name,
+        account_id=account_id,
+        activate=True,
+    )
 
 
 async def exchange_temp_token(
@@ -393,13 +404,24 @@ async def complete_manual_login(
     callback_input: str,
     expected_code: str | None,
     proxy: str | None = None,
+    *,
+    display_name: str | None = None,
+    account_id: str | None = None,
 ) -> LoginResult:
     try:
         params = validate_callback_input(callback_input, expected_code)
         assert params.temp_token is not None
         user_info = await exchange_temp_token(params.temp_token, proxy=proxy)
-        save_user_info(user_info)
-        return LoginResult(success=True, user_info=user_info)
+        saved_account_id = save_user_info(
+            user_info,
+            display_name=display_name,
+            account_id=account_id,
+        )
+        return LoginResult(
+            success=True,
+            user_info=user_info,
+            account_id=saved_account_id,
+        )
     except LoginCancelledError as exc:
         return LoginResult(success=False, cancelled=True, error=str(exc))
     except UnsupportedRegionError:
@@ -458,8 +480,12 @@ async def login(
         result = await asyncio.wait_for(future, timeout=timeout)
         temp_token = result["tempToken"]
         user_info = await exchange_temp_token(temp_token, proxy=proxy)
-        save_user_info(user_info)
-        return LoginResult(success=True, user_info=user_info)
+        saved_account_id = save_user_info(user_info)
+        return LoginResult(
+            success=True,
+            user_info=user_info,
+            account_id=saved_account_id,
+        )
     except asyncio.TimeoutError:
         return LoginResult(success=False, error="Login timeout")
     except LoginCancelledError:
@@ -479,10 +505,28 @@ async def login(
 
 
 def is_logged_in() -> bool:
-    return _load_token() is not None
+    try:
+        return get_active_account() is not None
+    except Exception:
+        return _load_token() is not None
 
 
 async def load_session() -> dict | None:
+    try:
+        active = get_active_account()
+    except Exception:
+        active = None
+    if active:
+        return {
+            "account_id": active.get("account_id", ""),
+            "display_name": active.get("display_name", ""),
+            "user_id": active.get("user_id", ""),
+            "user_name": active.get("user_name", ""),
+            "access_token": active.get("access_token", ""),
+            "refresh_token": active.get("refresh_token", ""),
+            "jwt_token": active.get("jwt_token", ""),
+        }
+
     token = _load_token()
     if not token:
         return None

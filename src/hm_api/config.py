@@ -67,6 +67,14 @@ def get_auth_file() -> Path:
     return get_cred_dir() / "auth.json"
 
 
+def get_accounts_file() -> Path:
+    return get_cred_dir() / "accounts.json"
+
+
+def get_usage_file() -> Path:
+    return get_cred_dir() / "usage.jsonl"
+
+
 CRED_DIR = get_cred_dir()
 TOKEN_FILE = get_token_file()
 AUTH_FILE = get_auth_file()

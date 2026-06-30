@@ -9,7 +9,7 @@ services:
       HM_API_PORT: 8000
       HM_API_KEY: ${HM_API_KEY:-}
       HM_API_PROXY: ${HM_API_PROXY:-}
-      HM_API_CRED_DIR: /data/cred
+      HM_API_CRED_DIR: ${HM_API_CRED_DIR:-/data/cred}
     volumes:
       - hm_api_cred:/data/cred
     restart: unless-stopped

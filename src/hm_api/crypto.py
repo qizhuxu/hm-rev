@@ -11,7 +11,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .config import get_auth_file, get_cred_dir
 
-SENSITIVE_KEYS = {"access", "refresh", "key", "token"}
+SENSITIVE_KEYS = {"access", "refresh", "key", "token", "jwt_token"}
 
 
 def _key_file() -> Path:
