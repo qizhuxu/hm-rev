@@ -8,7 +8,12 @@ from typing import Optional
 import typer
 from rich.console import Console
 
-from .config import DEFAULT_HOST, DEFAULT_PORT
+from .config import (
+    get_default_api_key,
+    get_default_host,
+    get_default_port,
+    get_default_proxy,
+)
 from .login import is_logged_in, load_session, login
 from .server import run_server
 
@@ -57,10 +62,10 @@ def login_cmd(
 @app.command()
 def serve(
     host: Optional[str] = typer.Option(
-        DEFAULT_HOST, "--host", "-h", help="Host to bind the server"
+        None, "--host", "-h", help="Host to bind the server"
     ),
     port: Optional[int] = typer.Option(
-        DEFAULT_PORT, "--port", "-p", help="Port to bind the server", min=1, max=65535
+        None, "--port", "-p", help="Port to bind the server", min=1, max=65535
     ),
     proxy: Optional[str] = typer.Option(
         "", "--proxy", help="HTTP/HTTPS proxy for upstream requests"
@@ -70,24 +75,25 @@ def serve(
     ),
 ) -> None:
     """Start the OpenAI-compatible API server."""
-    if not is_logged_in():
+    host_value = host or get_default_host()
+    port_value = port or get_default_port()
+    proxy = _empty_as_none(proxy) or get_default_proxy()
+    key = _empty_as_none(key) or get_default_api_key()
+
+    if is_logged_in():
+        session = asyncio.run(load_session())
+        if session:
+            console.print(
+                f"[blue]Logged in as {session.get('user_name') or session.get('user_id')}.[/blue]"
+            )
+    else:
         console.print(
-            "[yellow]Not logged in. Run [bold]hm-api login[/bold] first.[/yellow]"
-        )
-        raise typer.Exit(1)
-
-    import asyncio
-
-    session = asyncio.run(load_session())
-    if session:
-        console.print(
-            f"[blue]Logged in as {session.get('user_name') or session.get('user_id')}.[/blue]"
+            "[yellow]Not logged in. Open [bold]/ui[/bold] or run [bold]hm-api login[/bold].[/yellow]"
         )
 
-    proxy = _empty_as_none(proxy)
-    key = _empty_as_none(key)
-
-    console.print(f"[bold green]Starting server at http://{host}:{port}[/bold green]")
+    console.print(
+        f"[bold green]Starting server at http://{host_value}:{port_value}[/bold green]"
+    )
     if key:
         console.print("[dim]API key authentication enabled.[/dim]")
     else:
@@ -95,7 +101,7 @@ def serve(
     if proxy:
         console.print(f"[dim]Upstream proxy: {proxy}[/dim]")
 
-    run_server(host=host or DEFAULT_HOST, port=port or DEFAULT_PORT, api_key=key, proxy=proxy)
+    run_server(host=host_value, port=port_value, api_key=key, proxy=proxy)
 
 
 @app.command()

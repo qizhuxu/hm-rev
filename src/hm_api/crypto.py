@@ -5,24 +5,30 @@ from __future__ import annotations
 import base64
 import json
 import os
+from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from .config import CRED_DIR
+from .config import get_auth_file, get_cred_dir
 
 SENSITIVE_KEYS = {"access", "refresh", "key", "token"}
-KEY_FILE = CRED_DIR / ".kek"
+
+
+def _key_file() -> Path:
+    return get_cred_dir() / ".kek"
 
 
 def _get_kek() -> bytes:
-    CRED_DIR.mkdir(parents=True, exist_ok=True)
-    if KEY_FILE.exists():
-        with open(KEY_FILE, "rb") as f:
+    cred_dir = get_cred_dir()
+    key_file = _key_file()
+    cred_dir.mkdir(parents=True, exist_ok=True)
+    if key_file.exists():
+        with open(key_file, "rb") as f:
             return f.read()
     key = AESGCM.generate_key(bit_length=256)
-    with open(KEY_FILE, "wb") as f:
+    with open(key_file, "wb") as f:
         f.write(key)
-    os.chmod(KEY_FILE, 0o600)
+    os.chmod(key_file, 0o600)
     return key
 
 
@@ -74,11 +80,10 @@ def decrypt_record(record: dict) -> dict:
 
 
 def load_auth_data() -> dict:
-    from .config import AUTH_FILE
-
-    if not AUTH_FILE.exists():
+    auth_file = get_auth_file()
+    if not auth_file.exists():
         return {}
-    with open(AUTH_FILE, "r", encoding="utf-8") as f:
+    with open(auth_file, "r", encoding="utf-8") as f:
         raw = json.load(f)
     if not isinstance(raw, dict):
         return {}
@@ -86,12 +91,12 @@ def load_auth_data() -> dict:
 
 
 def save_auth_data(data: dict) -> None:
-    from .config import AUTH_FILE
-
-    CRED_DIR.mkdir(parents=True, exist_ok=True)
+    cred_dir = get_cred_dir()
+    auth_file = get_auth_file()
+    cred_dir.mkdir(parents=True, exist_ok=True)
     encrypted = {
         k: encrypt_record(v) if isinstance(v, dict) else v for k, v in data.items()
     }
-    with open(AUTH_FILE, "w", encoding="utf-8") as f:
+    with open(auth_file, "w", encoding="utf-8") as f:
         json.dump(encrypted, f, indent=2)
-    os.chmod(AUTH_FILE, 0o600)
+    os.chmod(auth_file, 0o600)

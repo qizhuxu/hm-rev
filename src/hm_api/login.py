@@ -9,7 +9,7 @@ import os
 import uuid
 import webbrowser
 from dataclasses import dataclass
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
@@ -22,10 +22,25 @@ from .config import (
     DEVECO_JWT_TOKEN_CHECK_URL,
     DEVECO_SUCCESS_REDIRECT_URL,
     DEVECO_TEMP_TOKEN_CHECK_URL,
-    TOKEN_FILE,
     USER_AGENT,
+    get_token_file,
 )
 from .crypto import decrypt_value, encrypt_value, load_auth_data, save_auth_data
+
+
+@dataclass(frozen=True)
+class LoginChallenge:
+    code: str
+    port: int
+    login_url: str
+
+
+@dataclass(frozen=True)
+class CallbackParams:
+    code: str | None
+    temp_token: str | None
+    site_id: str | None
+    quit: str | None
 
 
 @dataclass
@@ -57,6 +72,25 @@ class UnsupportedRegionError(Exception):
     pass
 
 
+def create_login_challenge(
+    port: int = DEVECO_DEFAULT_AUTH_PORT,
+    code: str | None = None,
+) -> LoginChallenge:
+    challenge_code = code or uuid.uuid4().hex.replace("-", "")
+    query = urlencode(
+        {
+            "port": port,
+            "appid": DEVECO_APP_ID,
+            "code": challenge_code,
+        }
+    )
+    return LoginChallenge(
+        code=challenge_code,
+        port=port,
+        login_url=f"{DEVECO_BASE_URL}/{DEVECO_AUTH_URL}?{query}",
+    )
+
+
 def _parse_request(data: bytes) -> tuple[str, str, bytes]:
     """Parse a simple HTTP request; return (method, path, body)."""
     try:
@@ -85,7 +119,7 @@ def _parse_request(data: bytes) -> tuple[str, str, bytes]:
     return method, path, body
 
 
-def _parse_callback(path: str, body: bytes) -> dict[str, str | None]:
+def _parse_callback_params(path: str, body: bytes) -> CallbackParams:
     parsed = urlparse(path)
     params = parse_qs(parsed.query)
     if body:
@@ -97,12 +131,67 @@ def _parse_callback(path: str, body: bytes) -> dict[str, str | None]:
         values = params.get(key)
         return values[0] if values else None
 
+    return CallbackParams(
+        code=_first("code"),
+        temp_token=_first("tempToken"),
+        site_id=_first("siteId"),
+        quit=_first("quit"),
+    )
+
+
+def _parse_callback(path: str, body: bytes) -> dict[str, str | None]:
+    params = _parse_callback_params(path, body)
     return {
-        "code": _first("code"),
-        "tempToken": _first("tempToken"),
-        "siteId": _first("siteId"),
-        "quit": _first("quit"),
+        "code": params.code,
+        "tempToken": params.temp_token,
+        "siteId": params.site_id,
+        "quit": params.quit,
     }
+
+
+def parse_callback_input(callback_input: str) -> CallbackParams:
+    value = callback_input.strip()
+    if not value:
+        return CallbackParams(code=None, temp_token=None, site_id=None, quit=None)
+
+    if value.upper().startswith(("GET ", "POST ")):
+        _method, path, body = _parse_request(value.encode("utf-8"))
+        return _parse_callback_params(path, body)
+
+    first_line = value.splitlines()[0].strip()
+    if first_line.startswith("?"):
+        path = f"/callback{first_line}"
+    elif "?" not in first_line and "=" in first_line:
+        path = f"/callback?{first_line.lstrip('?')}"
+    else:
+        path = first_line
+    return _parse_callback_params(path, b"")
+
+
+def validate_callback_params(
+    params: CallbackParams,
+    expected_code: str | None,
+) -> CallbackParams:
+    if not params.code or (expected_code and params.code != expected_code):
+        raise LoginCancelledError("Login code mismatch")
+    if params.quit in ("true", "access_denied"):
+        raise LoginCancelledError(
+            "Access denied by user"
+            if params.quit == "access_denied"
+            else "Login cancelled by user"
+        )
+    if not params.temp_token or not params.site_id:
+        raise LoginCancelledError("Missing tempToken or siteId")
+    if params.site_id != "1":
+        raise UnsupportedRegionError("Unsupported region")
+    return params
+
+
+def validate_callback_input(
+    callback_input: str,
+    expected_code: str | None,
+) -> CallbackParams:
+    return validate_callback_params(parse_callback_input(callback_input), expected_code)
 
 
 async def _callback_handler(
@@ -128,11 +217,11 @@ async def _callback_handler(
         await writer.wait_closed()
         return
 
-    params = _parse_callback(path, body)
-    code = params["code"]
-    temp_token = params["tempToken"]
-    site_id = params["siteId"]
-    quit = params["quit"]
+    params = _parse_callback_params(path, body)
+    code = params.code
+    temp_token = params.temp_token
+    site_id = params.site_id
+    quit = params.quit
 
     print(
         f"[hm-api login] callback received: code={bool(code)}, "
@@ -222,18 +311,19 @@ def _parse_jwt(token: str) -> dict:
 
 
 def _save_token(jwt_token: str) -> None:
-    CRED_DIR = TOKEN_FILE.parent
-    CRED_DIR.mkdir(parents=True, exist_ok=True)
+    token_file = get_token_file()
+    token_file.parent.mkdir(parents=True, exist_ok=True)
     blob = encrypt_value(jwt_token)
-    with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+    with open(token_file, "w", encoding="utf-8") as f:
         json.dump(blob, f)
-    os.chmod(TOKEN_FILE, 0o600)
+    os.chmod(token_file, 0o600)
 
 
 def _load_token() -> str | None:
-    if not TOKEN_FILE.exists():
+    token_file = get_token_file()
+    if not token_file.exists():
         return None
-    with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+    with open(token_file, "r", encoding="utf-8") as f:
         blob = json.load(f)
     return decrypt_value(blob)
 
@@ -246,6 +336,80 @@ def _save_access_token(access_token: str, refresh_token: str) -> None:
         "refresh": refresh_token,
     }
     save_auth_data(data)
+
+
+def save_user_info(user_info: UserInfo) -> None:
+    _save_token(user_info.jwt_token)
+    _save_access_token(user_info.access_token, user_info.refresh_token)
+
+
+async def exchange_temp_token(
+    temp_token: str,
+    proxy: str | None = None,
+) -> UserInfo:
+    actual_temp_token = temp_token.split("&")[0]
+
+    async with _build_client(proxy, timeout=30.0) as client:
+        jwt_resp = await client.get(
+            f"{DEVECO_BASE_URL}/{DEVECO_TEMP_TOKEN_CHECK_URL}",
+            params={
+                "tempToken": actual_temp_token,
+                "site": "CN",
+                "version": "1.0.0",
+                "appid": DEVECO_APP_ID,
+            },
+        )
+        if jwt_resp.status_code != 200:
+            raise RuntimeError(f"Failed to get JWT: {jwt_resp.status_code}")
+        jwt_token = jwt_resp.text.strip()
+        if len(jwt_token.split(".")) != 3:
+            raise ValueError("Invalid JWT format")
+
+        info_resp = await client.get(
+            f"{DEVECO_BASE_URL}/{DEVECO_JWT_TOKEN_CHECK_URL}",
+            headers={"refresh": "false", "jwtToken": jwt_token},
+        )
+        if info_resp.status_code != 200:
+            raise RuntimeError(f"Failed to check JWT: {info_resp.status_code}")
+        info_data = info_resp.json()
+        if not info_data.get("status") or not info_data.get("userInfo"):
+            raise ValueError("Invalid JWT userInfo")
+
+        user_info_raw = info_data["userInfo"]
+        payload = _parse_jwt(jwt_token)
+        return UserInfo(
+            user_id=payload.get("userId", ""),
+            user_name=payload.get("userName", ""),
+            access_token=user_info_raw.get("accessToken", ""),
+            refresh_token=user_info_raw.get("refreshToken", ""),
+            jwt_token=jwt_token,
+            country_code="CN",
+            language="zh_CN",
+            is_real_name=user_info_raw.get("realName") == "true",
+        )
+
+
+async def complete_manual_login(
+    callback_input: str,
+    expected_code: str | None,
+    proxy: str | None = None,
+) -> LoginResult:
+    try:
+        params = validate_callback_input(callback_input, expected_code)
+        assert params.temp_token is not None
+        user_info = await exchange_temp_token(params.temp_token, proxy=proxy)
+        save_user_info(user_info)
+        return LoginResult(success=True, user_info=user_info)
+    except LoginCancelledError as exc:
+        return LoginResult(success=False, cancelled=True, error=str(exc))
+    except UnsupportedRegionError:
+        return LoginResult(
+            success=False,
+            unsupported_region=True,
+            error="Only China site accounts are currently supported",
+        )
+    except Exception:
+        return LoginResult(success=False, error="Login failed")
 
 
 async def _start_callback_server(
@@ -283,10 +447,7 @@ async def login(
         return LoginResult(success=False, error="All local ports are in use")
 
     try:
-        login_url = (
-            f"{DEVECO_BASE_URL}/{DEVECO_AUTH_URL}"
-            f"?port={port}&appid={DEVECO_APP_ID}&code={client_secret}"
-        )
+        login_url = create_login_challenge(port=port, code=client_secret).login_url
         if no_browser:
             print(f"Please open this URL in your browser to login:\n{login_url}")
         else:
@@ -296,51 +457,9 @@ async def login(
 
         result = await asyncio.wait_for(future, timeout=timeout)
         temp_token = result["tempToken"]
-        actual_temp_token = temp_token.split("&")[0]
-
-        async with _build_client(proxy, timeout=30.0) as client:
-            jwt_resp = await client.get(
-                f"{DEVECO_BASE_URL}/{DEVECO_TEMP_TOKEN_CHECK_URL}",
-                params={
-                    "tempToken": actual_temp_token,
-                    "site": "CN",
-                    "version": "1.0.0",
-                    "appid": DEVECO_APP_ID,
-                },
-            )
-            if jwt_resp.status_code != 200:
-                raise RuntimeError(f"Failed to get JWT: {jwt_resp.status_code}")
-            jwt_token = jwt_resp.text.strip()
-            if len(jwt_token.split(".")) != 3:
-                raise ValueError("Invalid JWT format")
-
-            info_resp = await client.get(
-                f"{DEVECO_BASE_URL}/{DEVECO_JWT_TOKEN_CHECK_URL}",
-                headers={"refresh": "false", "jwtToken": jwt_token},
-            )
-            if info_resp.status_code != 200:
-                raise RuntimeError(f"Failed to check JWT: {info_resp.status_code}")
-            info_data = info_resp.json()
-            if not info_data.get("status") or not info_data.get("userInfo"):
-                raise ValueError("Invalid JWT userInfo")
-
-            user_info_raw = info_data["userInfo"]
-            payload = _parse_jwt(jwt_token)
-            user_info = UserInfo(
-                user_id=payload.get("userId", ""),
-                user_name=payload.get("userName", ""),
-                access_token=user_info_raw.get("accessToken", ""),
-                refresh_token=user_info_raw.get("refreshToken", ""),
-                jwt_token=jwt_token,
-                country_code="CN",
-                language="zh_CN",
-                is_real_name=user_info_raw.get("realName") == "true",
-            )
-
-            _save_token(jwt_token)
-            _save_access_token(user_info.access_token, user_info.refresh_token)
-
-            return LoginResult(success=True, user_info=user_info)
+        user_info = await exchange_temp_token(temp_token, proxy=proxy)
+        save_user_info(user_info)
+        return LoginResult(success=True, user_info=user_info)
     except asyncio.TimeoutError:
         return LoginResult(success=False, error="Login timeout")
     except LoginCancelledError:

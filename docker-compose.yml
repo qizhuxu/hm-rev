@@ -1,0 +1,18 @@
+services:
+  hm-api:
+    build: .
+    image: hm-api:local
+    ports:
+      - "${HM_API_PORT:-8000}:8000"
+    environment:
+      HM_API_HOST: 0.0.0.0
+      HM_API_PORT: 8000
+      HM_API_KEY: ${HM_API_KEY:-}
+      HM_API_PROXY: ${HM_API_PROXY:-}
+      HM_API_CRED_DIR: /data/cred
+    volumes:
+      - hm_api_cred:/data/cred
+    restart: unless-stopped
+
+volumes:
+  hm_api_cred:

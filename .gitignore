@@ -40,6 +40,9 @@ cred/
 *.enc
 *.kek
 *.key
+.env
+.env.*
+!.env.example
 
 # Logs and temp files
 *.log

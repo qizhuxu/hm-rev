@@ -6,6 +6,7 @@
 - Package code lives in `src/hm_api/`. The root `main.py` is only a placeholder entry point.
 - Use `uv` for dependency management and command execution. Runtime and dev dependencies are declared in `pyproject.toml`.
 - The app has real network side effects during OAuth login and proxy serving. Do not run login flows, open browsers, or call DevEco endpoints unless the user explicitly asks.
+- The FastAPI service also serves a lightweight management UI at `/ui` for login status, login URL generation, and manual OAuth callback completion.
 
 ## Source Map
 
@@ -16,6 +17,9 @@
 | `src/hm_api/server.py` | FastAPI app with `/v1/models` and `/v1/chat/completions`, including streaming passthrough. |
 | `src/hm_api/crypto.py` | AES-GCM helpers for encrypted local credential storage. |
 | `src/hm_api/config.py` | DevEco URLs, default ports, credential paths, and User-Agent constants. |
+| `Dockerfile` | uv-based Python 3.12 container image. |
+| `docker-compose.yml` | Local container deployment with persistent credential volume. |
+| `.github/workflows/docker-image.yml` | GHCR Docker image build/publish workflow. |
 
 ## Common Commands
 
@@ -26,11 +30,14 @@ uv run hm-api login --no-browser
 uv run hm-api serve --host 127.0.0.1 --port 8000 --key <secret>
 uv run ruff check src/
 uv run pyright src/
+uv run pytest
 ```
 
 - Prefer `uv run ...` over calling Python tools directly.
 - Use `--no-browser` for manual login testing so browser launch is explicit and visible.
 - Do not use a real API key, access token, refresh token, JWT, or DevEco credential in examples.
+- `hm-api serve` can start while logged out so `/ui` can complete login, especially in containers.
+- Runtime environment variables: `HM_API_HOST`, `HM_API_PORT`, `HM_API_KEY`, `HM_API_PROXY`, and `HM_API_CRED_DIR`.
 
 ## Tests And Verification
 
@@ -38,14 +45,16 @@ uv run pyright src/
 - Good first test targets: `_parse_request`, `_parse_callback`, `_parse_jwt`, auth middleware behavior in `build_app`, model-list response shaping, and credential encrypt/decrypt round trips using a temporary credential directory.
 - Mock `httpx`/DevEco network calls in tests. Avoid tests that require a Huawei account, browser, or live OAuth callback.
 - For code changes, run at least `uv run ruff check src/` and `uv run pyright src/`. Run any added tests as well.
+- This local workspace may not have Docker available. Do not claim Docker builds were verified locally unless a real `docker build` or `docker compose` command was run successfully.
 
 ## Security And Data Handling
 
 - `cred/`, `*.enc`, `*.kek`, and `*.key` are sensitive local artifacts. Never print, stage, commit, or include their contents in logs or docs.
 - Never log raw `access_token`, `refresh_token`, `jwt_token`, `tempToken`, API keys, or Authorization headers. Prefer booleans, redacted prefixes, or lengths only.
-- Keep bearer-token auth behavior in `server.py` conservative. When `--key` is set, every endpoint must require `Authorization: Bearer <key>`.
+- Keep bearer-token auth behavior in `server.py` conservative. When `--key` or `HM_API_KEY` is set, sensitive API routes must require `Authorization: Bearer <key>`. The static `/ui` page may remain public so browsers can load it, but UI API calls must stay protected.
 - Validate and fail clearly at boundaries: CLI options, JSON request bodies, callback parameters, proxy URLs, and upstream responses.
 - Preserve local-only callback binding (`127.0.0.1`) for OAuth unless there is an explicit, reviewed reason to change it.
+- Persist Docker credentials via a volume mounted at the configured `HM_API_CRED_DIR`; never bake `cred/` into an image layer.
 
 ## Coding Conventions
 
@@ -58,7 +67,7 @@ uv run pyright src/
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **hm-rev** (153 symbols, 279 relationships, 15 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **hm-rev** (171 symbols, 296 relationships, 15 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
