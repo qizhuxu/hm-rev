@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import time
 import uuid
@@ -144,6 +145,33 @@ def _usage_payload(response_data: Any) -> dict[str, Any] | None:
     if isinstance(response_data, dict) and isinstance(response_data.get("usage"), dict):
         return response_data["usage"]
     return None
+
+
+_DEBUG_REQUESTS = bool(os.getenv("HM_API_DEBUG_REQUESTS"))
+_DEBUG_FILE = os.getenv("HM_API_DEBUG_FILE", "debug-requests.jsonl")
+
+
+def _debug_log(label: str, request: Request, body_bytes: bytes, **extra: Any) -> None:
+    """Opt-in request logger (HM_API_DEBUG_REQUESTS=1) for diagnosing clients.
+
+    Writes the incoming request line, headers, and body to a JSONL file so we
+    can see exactly what a client (e.g. Cherry Studio) sends. Off by default.
+    """
+    if not _DEBUG_REQUESTS:
+        return
+    entry: dict[str, Any] = {
+        "label": label,
+        "method": request.method,
+        "path": request.url.path,
+        "headers": dict(request.headers),
+        "request_body": body_bytes.decode("utf-8", "replace")[:200000],
+    }
+    entry.update(extra)
+    try:
+        with open(_DEBUG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 def _overview_payload(api_key: str | None) -> dict[str, Any]:
@@ -586,9 +614,16 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
                 "content-length",
                 "content-type",
                 "connection",
+                "accept",
                 "accept-encoding",
                 "x-api-key",
                 "anthropic-version",
+                # Session-Id must only come from x-deveco-session /
+                # x-session-affinity (DevEco affinity). Clients (e.g. Codex)
+                # send their own session-id UUIDs which DevEco rejects as
+                # "Session-Id is too long" — don't forward them.
+                "session-id",
+                "thread-id",
             }:
                 continue
             base_headers[key] = value
@@ -616,6 +651,7 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
         failure (after exhausting failover). Caller formats the response.
         """
         base_headers = _build_upstream_headers(request)
+        base_headers["Accept"] = "application/json"
         url = f"{TARGET_BASE}/v2/no-stream/chat/completions"
         last_error: tuple[int, str] | None = None
         for index, account in enumerate(accounts):
@@ -638,6 +674,13 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
                 last_error = (
                     upstream_resp.status_code,
                     _redact_sensitive(upstream_resp.text or "Upstream error", account),
+                )
+                _debug_log(
+                    endpoint + ":upstream-error",
+                    request,
+                    openai_body_bytes[:4000],
+                    upstream_status=last_error[0],
+                    upstream_error=last_error[1],
                 )
                 if _can_try_next(strategy, index, accounts):
                     continue
@@ -697,6 +740,7 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
         single ``error`` event. Usage is recorded in a ``finally`` per attempt.
         """
         base_headers = _build_upstream_headers(request)
+        base_headers["Accept"] = "text/event-stream"
         url = f"{TARGET_BASE}/v2/chat/completions"
         last_error = "Upstream error"
         for index, account in enumerate(accounts):
@@ -717,6 +761,13 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
                             text.decode("utf-8", errors="replace")
                             or "Upstream error",
                             account,
+                        )
+                        _debug_log(
+                            endpoint + ":upstream-error",
+                            request,
+                            openai_body_bytes[:4000],
+                            upstream_status=status_code,
+                            upstream_error=last_error,
                         )
                     else:
                         success = True
@@ -755,11 +806,12 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
             raise HTTPException(status_code=401, detail="Not logged in")
 
         body_bytes = await request.body()
+        _debug_log("/v1/chat/completions", request, body_bytes)
         if not body_bytes:
             body_bytes = b"{}"
         try:
             body_json = json.loads(body_bytes)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             record_usage_event(
                 account_id=str(accounts[0]["account_id"]),
                 endpoint="/v1/chat/completions",
@@ -834,7 +886,7 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
         body_bytes = await request.body()
         try:
             body_json = json.loads(body_bytes or b"{}")
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             record_usage_event(
                 account_id=str(accounts[0]["account_id"]),
                 endpoint="/v1/messages",
@@ -850,6 +902,7 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
 
         model = str(body_json.get("model") or "")
         openai_body = anthropic_request_to_openai(body_json)
+        _debug_log("/v1/messages", request, body_bytes, upstream_body=openai_body)
         openai_bytes = json.dumps(openai_body, ensure_ascii=False).encode("utf-8")
         stream = bool(openai_body.get("stream"))
 
@@ -914,7 +967,7 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
         body_bytes = await request.body()
         try:
             body_json = json.loads(body_bytes or b"{}")
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             record_usage_event(
                 account_id=str(accounts[0]["account_id"]),
                 endpoint="/v1/responses",
@@ -930,6 +983,7 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
 
         model = str(body_json.get("model") or "")
         openai_body = responses_request_to_openai(body_json)
+        _debug_log("/v1/responses", request, body_bytes, upstream_body=openai_body)
         openai_bytes = json.dumps(openai_body, ensure_ascii=False).encode("utf-8")
         stream = bool(openai_body.get("stream"))
 

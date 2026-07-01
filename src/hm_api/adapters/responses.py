@@ -68,8 +68,18 @@ def _input_item_to_openai(item: Any) -> dict | None:
     if not isinstance(item, dict):
         return None
     itype = item.get("type")
+    # Some clients (e.g. Cherry Studio) send message items without an explicit
+    # "type" field — the Responses API allows the shorthand {"role","content"}.
+    # Treat such items as messages.
+    if itype is None and ("role" in item or "content" in item):
+        itype = "message"
     if itype == "message":
         role = item.get("role") or "user"
+        # OpenAI's "developer" role (privileged instructions) is not accepted
+        # by DevEco's upstream — map it to "system", which is semantically
+        # equivalent and supported.
+        if role == "developer":
+            role = "system"
         content = item.get("content")
         if isinstance(content, str):
             return {"role": role, "content": content}
@@ -87,7 +97,11 @@ def _input_item_to_openai(item: Any) -> dict | None:
                         parts.append(image)
             if not parts:
                 return {"role": role, "content": ""}
-            return {"role": role, "content": parts[0] if len(parts) == 1 else parts}
+            if len(parts) == 1 and parts[0].get("type") == "text":
+                # Single text part: send a plain string (upstream doesn't accept
+                # a bare content-part dict).
+                return {"role": role, "content": parts[0]["text"]}
+            return {"role": role, "content": parts}
         return {"role": role, "content": ""}
     if itype == "function_call":
         return {
@@ -171,7 +185,7 @@ def openai_response_to_responses(content: dict, model: str) -> dict:
     output: list[dict] = []
     text = message.get("content")
     if isinstance(text, str) and text:
-        output.append(_message_item(uuid.uuid4().hex, text))
+        output.append(_message_item("msg_" + uuid.uuid4().hex, text))
     elif isinstance(text, list):
         parts = [
             {"type": "output_text", "text": str(p.get("text", "")), "annotations": []}
@@ -226,10 +240,10 @@ def responses_error(status: int, message: str) -> dict:
     return {"error": {"message": message, "type": etype}}
 
 
-def _message_item(suffix: str, text: str) -> dict:
+def _message_item(item_id: str, text: str) -> dict:
     return {
         "type": "message",
-        "id": "msg_" + suffix,
+        "id": item_id,
         "role": "assistant",
         "status": "completed",
         "content": [{"type": "output_text", "text": text, "annotations": []}],
@@ -362,7 +376,7 @@ async def openai_stream_to_responses(
                             "part": {"type": "output_text", "text": ti["text"], "annotations": []},
                         },
                     )
-                    full = _message_item(uuid.uuid4().hex, ti["text"])
+                    full = _message_item(ti["item_id"], ti["text"])
                     yield sse_event(
                         "response.output_item.done",
                         {
@@ -441,7 +455,7 @@ async def openai_stream_to_responses(
                 "part": {"type": "output_text", "text": ti["text"], "annotations": []},
             },
         )
-        full = _message_item(uuid.uuid4().hex, ti["text"])
+        full = _message_item(ti["item_id"], ti["text"])
         yield sse_event(
             "response.output_item.done",
             {

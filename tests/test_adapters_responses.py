@@ -64,7 +64,7 @@ def test_responses_request_translates_instructions_and_items():
     out = responses_request_to_openai(body)
     msgs = out["messages"]
     assert msgs[0] == {"role": "system", "content": "Be brief."}
-    assert msgs[1] == {"role": "user", "content": {"type": "text", "text": "hi"}}
+    assert msgs[1] == {"role": "user", "content": "hi"}
     assert msgs[2]["role"] == "assistant"
     assert msgs[2]["tool_calls"][0]["id"] == "c1"
     assert msgs[2]["tool_calls"][0]["function"]["arguments"] == '{"a": 1}'
@@ -82,6 +82,39 @@ def test_responses_request_translates_instructions_and_items():
 def test_responses_request_string_input():
     out = responses_request_to_openai({"model": "m", "input": "hello"})
     assert out["messages"] == [{"role": "user", "content": "hello"}]
+
+
+def test_responses_request_maps_developer_role_to_system():
+    # Codex sends message items with role="developer"; DevEco's upstream only
+    # accepts [function, user, assistant, system, tool]. Map developer->system.
+    body = {
+        "model": "m",
+        "input": [
+            {"type": "message", "role": "developer", "content": "system instructions"},
+            {"type": "message", "role": "user", "content": "hi"},
+        ],
+    }
+    msgs = responses_request_to_openai(body)["messages"]
+    assert msgs[0]["role"] == "system"
+    assert msgs[0]["content"] == "system instructions"
+    assert msgs[1]["role"] == "user"
+
+
+def test_responses_request_handles_shorthand_input_items():
+    # Cherry Studio sends input items without an explicit "type" field
+    # (shorthand {"role","content"}). These must still be treated as messages.
+    body = {
+        "model": "GLM-5.1",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "你好"}]}],
+        "store": False,
+        "include": ["reasoning.encrypted_content"],
+        "stream": True,
+    }
+    out = responses_request_to_openai(body)
+    assert out["messages"] == [
+        {"role": "user", "content": "你好"}
+    ]
+    assert out["stream"] is True
 
 
 def test_responses_tools_skip_builtin():
@@ -189,6 +222,12 @@ def test_responses_stream_text_only():
     ]
     deltas = [e[1] for e in events if e[0] == "response.output_text.delta"]
     assert [d["delta"] for d in deltas] == ["Hi", " there"]
+    # The item id must stay stable across added/delta/done (Vercel AI SDK keys
+    # text parts by item_id and errors if output_item.done uses a new id).
+    added = next(e[1] for e in events if e[0] == "response.output_item.added")
+    done = next(e[1] for e in events if e[0] == "response.output_item.done")
+    assert added["item"]["id"] == done["item"]["id"]
+    assert all(d["item_id"] == added["item"]["id"] for d in deltas)
     completed = next(e[1] for e in events if e[0] == "response.completed")
     assert completed["response"]["status"] == "completed"
     assert completed["response"]["output"][0]["content"][0]["text"] == "Hi there"

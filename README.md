@@ -139,7 +139,7 @@ curl http://127.0.0.1:8000/v1/responses \
 
 三种格式都支持工具调用，并在格式间互转（Anthropic `tool_use` ↔ OpenAI `tool_calls` ↔ Responses `function_call`）。例如向 `/v1/messages` 传 `tools`（含 `input_schema`），代理会转成 OpenAI `tools`（含 `parameters`）发给上游，再把上游返回的 `tool_calls` 转回 Anthropic `tool_use` content block。
 
-> 上游能力说明：`/v1/messages`、`/v1/responses` 与工具调用基于“DevEco `v2/chat/completions` 遵循 OpenAI 工具字段”的假设实现。是否真正执行 `tools`/`tool_choice`、流式 `tool_calls` 增量字段名、`usage` 字段名，需用真实账号验证一次；若上游行为不同，请同步调整 `src/hm_api/adapters/` 并更新本说明。
+> 上游能力说明（已用真实账号验证，2026-06-30）：DevEco `v2/chat/completions` 遵循 OpenAI 工具字段——会执行 `tools`/`tool_choice` 并返回 `tool_calls`（`finish_reason:"tool_calls"`，`id` 形如 `chatcmpl-tool-<hex>`）；流式按 `delta.tool_calls[].function.arguments` 分片输出；`usage` 使用 `prompt_tokens`/`completion_tokens`/`total_tokens`，且每个流式分片都带 `usage`。`/v1/messages`、`/v1/responses` 的翻译与工具调用已据此验证可用。
 
 `/v1/responses` 为无状态实现：`previous_response_id` / `store` 等参数被接受但忽略；内置工具（web_search / code_interpreter / file_search）不转发。
 

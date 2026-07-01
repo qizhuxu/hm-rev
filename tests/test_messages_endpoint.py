@@ -216,3 +216,96 @@ def test_messages_failover_retries_next_account(monkeypatch, tmp_path):
     assert resp.json()["content"] == [{"type": "text", "text": "ok"}]
     assert calls == ["Bearer access-1", "Bearer access-2"]
     assert "access-1" not in resp.text
+
+
+def test_messages_stream_overrides_client_accept_header(monkeypatch, tmp_path):
+    """Anthropic SDK sends Accept: application/json even when streaming; the
+    upstream streaming endpoint rejects that. The proxy must set
+    Accept: text/event-stream itself and not forward the client's value."""
+    monkeypatch.setenv("HM_API_CRED_DIR", str(tmp_path / "cred"))
+    save_account_from_user_info(_user_info())
+    captured: list[dict] = []
+    sse = b'data: {"choices":[{"delta":{"content":"Hi"},"index":0}]}\n\ndata: [DONE]\n\n'
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def stream(self, method, url, headers, content):
+            captured.append(headers)
+            return _StreamCtx(200, sse)
+
+    monkeypatch.setattr("hm_api.server.httpx.AsyncClient", FakeClient)
+    client = TestClient(build_app())
+    resp = client.post(
+        "/v1/messages",
+        json={"model": "m", "max_tokens": 1, "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+        headers={"Accept": "application/json"},
+    )
+    assert resp.status_code == 200
+    assert captured[0]["Accept"] == "text/event-stream"
+
+
+def test_messages_nonstream_sets_accept_json(monkeypatch, tmp_path):
+    monkeypatch.setenv("HM_API_CRED_DIR", str(tmp_path / "cred"))
+    save_account_from_user_info(_user_info())
+    captured: list[dict] = []
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def post(self, url, headers, content):
+            captured.append(headers)
+            return _FakeResponse(
+                200,
+                {"choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]},
+            )
+
+    monkeypatch.setattr("hm_api.server.httpx.AsyncClient", FakeClient)
+    client = TestClient(build_app())
+    resp = client.post(
+        "/v1/messages",
+        json={"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]},
+        headers={"Accept": "text/event-stream"},
+    )
+    assert resp.status_code == 200
+    assert captured[0]["Accept"] == "application/json"
+
+
+def test_messages_does_not_forward_client_session_id(monkeypatch, tmp_path):
+    """Codex sends its own session-id/thread-id UUIDs; DevEco's upstream rejects
+    them ("Session-Id is too long"). The proxy must not forward client session
+    headers — Session-Id comes only from x-deveco-session/x-session-affinity."""
+    monkeypatch.setenv("HM_API_CRED_DIR", str(tmp_path / "cred"))
+    save_account_from_user_info(_user_info())
+    captured: list[dict] = []
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def post(self, url, headers, content):
+            captured.append(headers)
+            return _FakeResponse(
+                200,
+                {"choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]},
+            )
+
+    monkeypatch.setattr("hm_api.server.httpx.AsyncClient", FakeClient)
+    client = TestClient(build_app())
+    client.post(
+        "/v1/messages",
+        json={"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]},
+        headers={
+            "session-id": "019f1b2c-b4d2-7af2-bec6-242e802d0426",
+            "thread-id": "019f1b2c-b4d2-7af2-bec6-242e802d0426",
+            "x-deveco-session": "devsession123",
+        },
+    )
+    sent = captured[0]
+    # Client's session-id/thread-id must NOT be forwarded.
+    assert "session-id" not in sent
+    assert "thread-id" not in sent
+    # x-deveco-session IS mapped to Session-Id.
+    assert sent.get("Session-Id") == "devsession123"

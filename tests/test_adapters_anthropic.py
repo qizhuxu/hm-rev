@@ -103,7 +103,7 @@ def test_anthropic_request_translates_tool_use_and_tool_result():
     assert json.loads(call["function"]["arguments"]) == {"a": 1}
     assert msgs[1] == {"role": "tool", "tool_call_id": "tu1", "content": "42"}
     assert msgs[2]["role"] == "user"
-    assert msgs[2]["content"] == {"type": "text", "text": "thanks"}
+    assert msgs[2]["content"] == "thanks"
 
 
 def test_anthropic_request_translates_tools_and_tool_choice():
@@ -215,7 +215,13 @@ def test_anthropic_error_shape():
 
 def test_anthropic_stream_text_only():
     items = [
-        StreamEvent("chunk", {"choices": [{"delta": {"content": "Hello"}, "index": 0}]}),
+        StreamEvent(
+            "chunk",
+            {
+                "choices": [{"delta": {"content": "Hello"}, "index": 0}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+            },
+        ),
         StreamEvent(
             "chunk",
             {
@@ -238,6 +244,8 @@ def test_anthropic_stream_text_only():
         "message_delta",
         "message_stop",
     ]
+    msg_start = next(e[1] for e in events if e[0] == "message_start")
+    assert msg_start["message"]["usage"]["input_tokens"] == 3
     deltas = [e[1] for e in events if e[0] == "content_block_delta"]
     assert deltas[0]["delta"] == {"type": "text_delta", "text": "Hello"}
     assert deltas[1]["delta"] == {"type": "text_delta", "text": " world"}

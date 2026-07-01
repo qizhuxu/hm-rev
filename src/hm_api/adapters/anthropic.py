@@ -129,16 +129,15 @@ def _messages_to_openai(messages: list) -> list[dict[str, Any]]:
                     }
                 )
             if text_parts or image_parts:
-                parts: list[dict] = []
-                parts.extend(image_parts)
-                if text_parts:
-                    parts.append({"type": "text", "text": "".join(text_parts)})
-                out.append(
-                    {
-                        "role": "user",
-                        "content": parts[0] if len(parts) == 1 else parts,
-                    }
-                )
+                if image_parts:
+                    parts: list[dict] = list(image_parts)
+                    if text_parts:
+                        parts.append({"type": "text", "text": "".join(text_parts)})
+                    out.append({"role": "user", "content": parts})
+                else:
+                    # Text-only: DevEco's OpenAI-compatible upstream accepts a
+                    # plain string but not a bare content-part dict.
+                    out.append({"role": "user", "content": "".join(text_parts)})
         else:
             out.append({"role": role, "content": "".join(text_parts) or ""})
     return out
@@ -319,6 +318,14 @@ async def openai_stream_to_anthropic(
         if ev.kind == "done":
             break
         chunk = ev.data or {}
+        # Read usage first so message_start can report the real input_tokens
+        # (DevEco sends prompt_tokens in every chunk, including the first).
+        usage = chunk.get("usage")
+        if isinstance(usage, dict):
+            if usage.get("prompt_tokens") is not None:
+                usage_input = int(usage["prompt_tokens"])
+            if usage.get("completion_tokens") is not None:
+                usage_output = int(usage["completion_tokens"])
         if not started:
             started = True
             yield sse_event("message_start", _message_start(msg_id, model, usage_input, 0))
@@ -394,10 +401,6 @@ async def openai_stream_to_anthropic(
 
         if choice.get("finish_reason"):
             finish_reason = choice["finish_reason"]
-        usage = chunk.get("usage")
-        if isinstance(usage, dict):
-            usage_input = int(usage.get("prompt_tokens") or usage_input or 0)
-            usage_output = int(usage.get("completion_tokens") or usage_output or 0)
 
     if not started:
         yield sse_event("message_start", _message_start(msg_id, model, 0, 0))
