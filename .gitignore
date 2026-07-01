@@ -74,3 +74,4 @@ Thumbs.db
 hm-api.zip
 *.whl
 .ui-shots
+.trellis

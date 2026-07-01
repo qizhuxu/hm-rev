@@ -269,17 +269,23 @@ def build_app(api_key: str | None = None, proxy: str | None = None) -> FastAPI:
             }
         )
 
-    @app.post("/callback")
+    @app.api_route("/callback", methods=["GET", "POST"])
     async def handle_callback(request: Request) -> RedirectResponse:
-        """Receive DevEco OAuth POST callback and complete login.
+        """Receive DevEco OAuth callback and complete login.
 
-        DevEco redirects the user's browser to POST the callback (form-urlencoded)
-        to the URL we specified in the login URL. This endpoint captures it,
-        exchanges the tempToken for real credentials, saves the account, then
-        redirects the browser back to the management console.
+        DevEco redirects the user's browser back to ``http://localhost:<port>/callback``
+        with ``code``/``tempToken``/``siteId``/``quit`` as **query parameters** (302
+        GET redirect). Some clients POST them form-urlencoded in the body. Accept
+        both, and parse params from the URL query AND the body. Then exchange the
+        tempToken for real credentials, save the account, and redirect the browser
+        back to the management console.
         """
         body = await request.body()
-        parsed = _parse_callback_params("/callback", body)
+        query_string = str(request.url.query)
+        path_with_query = request.url.path + (
+            "?" + query_string if query_string else ""
+        )
+        parsed = _parse_callback_params(path_with_query, body)
 
         code = parsed.code
         temp_token = parsed.temp_token
